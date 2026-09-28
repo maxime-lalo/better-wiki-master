@@ -23,7 +23,8 @@ Les améliorations s'appliquent au site ouvert dans ce navigateur. Elles ne s'in
 - **Prix sur les cartes** : prix moyen, dernière vente et nombre de ventes, selon la rareté effective et les données du formulaire de mise aux enchères.
 - **Cache sans expiration** : les données déjà récupérées sont réutilisées. Le bouton **↻** actualise une carte ; sa date de consultation reste visible.
 - **Bandeau permanent** : reste visible sur la collection et pendant le défilement, avec l'état, le nom de la carte en cours, la prochaine carte, le compte à rebours et le nombre de cartes de la page en cache.
-- **Chargement progressif** : prix manquants des cartes visibles, une seule requête à la fois entre tous les onglets. Le délai réglable commence **après réception et traitement complets de la réponse précédente**, pas au départ de la requête. Pas de parcours automatique des autres pages.
+- **Chargement progressif** : prix manquants des cartes visibles à l'écran, une seule requête à la fois entre tous les onglets. Le délai réglable commence **après réception et traitement complets de la réponse précédente**, pas au départ de la requête.
+- **Pages suivantes en option** : la case **Passer automatiquement à la page suivante** active le clic sur le bouton natif **Suivant** après traitement des cartes visibles. Les filtres sont conservés et le parcours s'arrête à la dernière page.
 - **Pauses API** : arrêt sur les erreurs prévues, prise en compte de `Retry-After` et bouton de reprise manuelle. Le cache reste consultable pendant l'arrêt.
 - **Notifications filtrables** : choix d'un type, compteurs et mémorisation du filtre. Le filtre porte sur les notifications déjà chargées, sans requête supplémentaire.
 - **Mise aux enchères sur place** : après succès, fermeture du formulaire et du détail, retrait du seul exemplaire concerné, conservation des filtres et de la page, sans rechargement global de la collection.
@@ -97,7 +98,11 @@ Exemple : avec un délai de 3 secondes et une réponse de la carte A qui prend 2
 
 Désactiver la synchronisation empêche les prochains appels du script, y compris les actualisations ↻. Une requête déjà en cours termine et alimente le cache ; les consultations natives du site continuent normalement. Réactiver reprend les prix manquants visibles en respectant le délai restant et les pauses serveur. Cela ne lève pas un arrêt `automation_limit` : le bouton de reprise existant reste distinct.
 
-L'interrupteur et le délai sont conservés entre visites et partagés entre les onglets du même navigateur. Le bandeau indique aussi la carte chargée dans un autre onglet. Après mise à jour, recharger les anciens onglets pour qu'ils utilisent tous cette coordination. Les états **À jour**, **Désactivée**, **En cours**, **En attente** et **En pause** restent affichés même quand aucun appel n'est lancé.
+La case **Passer automatiquement à la page suivante** est décochée par défaut. Une fois activée, le script traite **uniquement les cartes visibles dans la fenêtre**, une par une, puis clique sur **Suivant** quand leurs prix sont en cache. Il attend la réponse et l'affichage de la nouvelle page avant de recommencer. Il part de la page actuelle, conserve les filtres et s'arrête à la dernière page ; il ne revient pas au début. Il ne fait pas défiler la grille pour chercher les cartes hors écran : **celles-ci restent volontairement non chargées**. Le défilement habituel déclenché par le bouton natif reste celui du site.
+
+Le délai choisi s'applique aussi avant le clic sur **Suivant** et après le chargement de la page, même lorsque ses prix sont déjà en cache. Une fenêtre de carte ouverte ou un onglet masqué suspend le passage automatique. Décocher l'option arrête les prochains changements de page ; l'interrupteur général arrête aussi les prochains chargements de prix. Une navigation en cours peut se terminer. Un échec de navigation arrête le parcours et affiche le bouton **Reprendre le chargement**, toujours soumis aux pauses serveur.
+
+L'interrupteur, le délai et la case de pagination sont conservés entre visites et partagés entre les onglets du même navigateur. Le bandeau indique aussi la carte ou la page chargée dans un autre onglet. Après mise à jour, recharger les anciens onglets pour qu'ils utilisent tous cette coordination. Les états **À jour**, **Désactivée**, **En cours**, **En attente** et **En pause** restent affichés même quand aucun appel n'est lancé.
 
 ## Confidentialité et limites
 
@@ -115,7 +120,7 @@ npx playwright install chromium
 npm test
 ```
 
-Les quatre suites utilisent des pages isolées et des réponses réseau simulées : **34 assertions pour les prix, 15 pour les notifications, 23 pour les enchères et 30 pour la synchronisation**. Les contrôles couvrent notamment les réponses lentes dont le corps arrive après les en-têtes, le délai entre deux onglets, les réglages persistants, l'arrêt pendant une requête et le maintien des pauses serveur. Aucun compte WikiMasters n'est nécessaire et aucune enchère réelle n'est créée.
+Les cinq suites utilisent des pages isolées et des réponses réseau simulées. Elles couvrent les prix, les notifications, les enchères, les réglages de synchronisation et la pagination. Les contrôles vérifient notamment les réponses lentes dont le corps arrive après les en-têtes, le délai entre deux onglets, les réglages persistants, l'arrêt pendant une requête, les pauses serveur et le parcours des seules cartes visibles sans double clic sur **Suivant**. Aucun compte WikiMasters n'est nécessaire et aucune enchère réelle n'est créée.
 
 Une vérification séparée sur l'interface réelle avec soumission simulée a également contrôlé la conservation de la page, des filtres et des autres cartes. Les extensions elles-mêmes et les installations physiques Android/iOS restent à valider ; un écran de 390 px n'est pas un test sur téléphone.
 

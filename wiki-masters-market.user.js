@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters — Prix de la collection
 // @namespace    local.wikimasters.collection
-// @version      1.4.0
+// @version      1.5.0
 // @description  Prix en cache, filtres des notifications et mise aux enchères sans quitter la collection.
 // @author       maxime-lalo
 // @license      MIT
@@ -81,6 +81,12 @@
   let storageOK = true;
   let resuming = false;
   let lastResumeRevision = 0;
+  const collectionLoads = new Set();
+  let collectionSerial = 0;
+  let lastCollectionLoad = null;
+  let pageCandidate = null;
+  let activePage = null;
+  let pageError = '';
   const notificationPanels = new Map();
   const savedNotificationType = read(NOTIFICATION_FILTER_KEY);
   let notificationType = typeof savedNotificationType === 'string' ? savedNotificationType : '';
@@ -121,12 +127,15 @@
     const intervalMs = Number.isFinite(saved?.intervalMs)
       ? Math.round(saved.intervalMs / 500) * 500 : DEFAULT_INTERVAL_MS;
     return { enabled: typeof saved?.enabled === 'boolean' ? saved.enabled : true,
+      autoNext: saved?.autoNext === true,
       intervalMs: Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS, intervalMs)) };
   }
   function setSyncSettings(update) {
     const settings = { ...syncSettings(), ...update };
     if (!write(SETTINGS_KEY, settings)) { renderAll(); return; }
     if (!settings.enabled) manual.clear();
+    pageCandidate = null;
+    if (update.autoNext !== undefined) pageError = '';
     renderAll();
     void pump();
   }
@@ -135,7 +144,7 @@
     const request = g?.request;
     return { next: Number(g?.next) || 0, until: Number(g?.until) || 0,
       waitFrom: Number(g?.waitFrom) || 0,
-      request: UUID.test(request?.id) && typeof request.title === 'string'
+      request: (UUID.test(request?.id) || request?.kind === 'page') && typeof request.title === 'string'
         && Number.isFinite(request.expiresAt) ? request : null,
       retryAfterUntil: Number(g?.retryAfterUntil) || 0, resumeRevision: Number(g?.resumeRevision) || 0 };
   }
@@ -170,7 +179,10 @@
   window.fetch = async function (...args) {
     const started = Date.now();
     const listing = captureAuctionSubmission(args);
-    const response = await nativeFetch(...args);
+    const collectionLoad = observeCollectionLoad(args);
+    let response;
+    try { response = await nativeFetch(...args); }
+    catch (error) { finishCollectionLoad(collectionLoad, false); throw error; }
     if (listing && response.ok) {
       // Le formulaire natif appelle response.json(), puis son onListed relance
       // cartes/étiquettes/échanges et router.push quitte la collection. Pour ce
@@ -211,8 +223,9 @@
       if (response.ok && match && url.searchParams.get('scope') === 'summary') {
         response.clone().json().then(data => save(match[1], data, started)).catch(() => {});
       }
-      if (response.ok && url.pathname === '/api/my-collection') {
+      if (collectionLoad && response.ok) {
         response.clone().json().then(data => {
+          if (!Array.isArray(data.collection)) throw new Error('Collection invalide');
           for (const item of data.collection || []) {
             if (!UUID.test(item.card?.id)) continue;
             const card = { ...item.card, rarity: item.snapshot_rarity ?? item.card.rarity };
@@ -221,12 +234,33 @@
             ids.add(card.id);
             catalogue.set(key, ids);
           }
+          finishCollectionLoad(collectionLoad, true);
           scheduleScan();
-        }).catch(() => {});
-      }
-    } catch { /* L'observation ne doit jamais casser les requêtes du site. */ }
+        }).catch(() => finishCollectionLoad(collectionLoad, false));
+      } else finishCollectionLoad(collectionLoad, false);
+    } catch { finishCollectionLoad(collectionLoad, false); /* Préserver les requêtes natives. */ }
     return response;
   };
+
+  function observeCollectionLoad(args) {
+    try {
+      const input = args[0];
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
+      const method = String(args[1]?.method || input?.method || 'GET').toUpperCase();
+      if (url.origin !== location.origin || url.pathname !== '/api/my-collection' || method !== 'GET') return null;
+      const load = { serial: ++collectionSerial, page: Number(url.searchParams.get('page') || 0) + 1, done: false, ok: false };
+      collectionLoads.add(load);
+      lastCollectionLoad = load;
+      pageCandidate = null;
+      return load;
+    } catch { return null; }
+  }
+  function finishCollectionLoad(load, ok) {
+    if (!load) return;
+    load.done = true;
+    load.ok = ok;
+    collectionLoads.delete(load);
+  }
 
   function captureAuctionSubmission(args) {
     try {
@@ -448,6 +482,8 @@
         lastResumeRevision = next.resumeRevision;
         failures.clear();
         manual.clear();
+        pageError = '';
+        pageCandidate = null;
       });
     } catch (error) { console.warn('[WikiMasters prix]', error); }
     finally { resuming = false; renderAll(); }
@@ -469,6 +505,7 @@
         <label class="wm-sync-delay" for="wm-sync-delay"><span>Délai après chaque réponse <output></output></span>
           <input id="wm-sync-delay" type="range" min="1" max="30" step="0.5" aria-label="Délai après chaque réponse (secondes)">
         </label>
+        <label class="wm-sync-auto-next"><input type="checkbox"><span>Passer automatiquement à la page suivante</span></label>
         <button class="wm-sync-resume" type="button">Reprendre le chargement</button>
       </div>`;
       controls.querySelector('[role="switch"]').addEventListener('change', event => {
@@ -476,6 +513,9 @@
       });
       controls.querySelector('input[type="range"]').addEventListener('input', event => {
         setSyncSettings({ intervalMs: Number(event.target.value) * 1000 });
+      });
+      controls.querySelector('.wm-sync-auto-next input').addEventListener('change', event => {
+        setSyncSettings({ autoNext: event.target.checked });
       });
       controls.querySelector('.wm-sync-resume').addEventListener('click', () => { void resumeLoading(); });
       const heading = main.querySelector('h1');
@@ -492,11 +532,12 @@
     const job = choose();
     const currentViews = [...views.values()].filter(v => v.node.isConnected);
     const visibleViews = currentViews.filter(visible);
-    const errors = currentViews.some(v => failures.has(v.id));
+    const errors = !!pageError || currentViews.some(v => failures.has(v.id));
     let message;
     let detail = 'Les prix en cache sont conservés.';
     if (request) {
-      message = `Synchronisation en cours — ${request.title}${activeId === request.id ? '' : ' (autre onglet)'}`;
+      const local = request.kind === 'page' ? activePage !== null : activeId === request.id;
+      message = `${request.kind === 'page' ? 'Changement de page en cours' : 'Synchronisation en cours'} — ${request.title}${local ? '' : ' (autre onglet)'}`;
       if (!settings.enabled) detail = 'Arrêt demandé : cette requête se termine, puis aucun autre appel ne sera lancé.';
       else detail = 'Le délai commencera après réception complète de cette réponse.';
     } else if (!storageOK) message = 'Synchronisation indisponible — stockage local inaccessible.';
@@ -511,6 +552,10 @@
       message = 'Synchronisation en pause après une erreur.';
       detail = `Pause jusqu’au ${new Date(g.until).toLocaleString('fr-FR')}. Les prix en cache sont conservés.`;
     } else if (document.hidden) message = 'Synchronisation en attente — onglet non visible.';
+    else if (pageError && settings.autoNext) {
+      message = 'Passage automatique arrêté.';
+      detail = pageError + ' Utiliser « Reprendre le chargement » pour réessayer.';
+    } else if (collectionLoads.size) message = 'En attente du chargement de la collection.';
     else if (job) {
       const remaining = Math.max(0, nextRequestAt(g, settings) - now);
       message = remaining ? 'En attente du prochain chargement.' : 'Synchronisation prête.';
@@ -519,8 +564,16 @@
         : `Prochaine carte : ${title}.`;
     } else if (errors) message = 'Chargement arrêté — certains prix sont en erreur.';
     else if (!visibleViews.length) message = 'En attente de cartes visibles à synchroniser.';
-    else if (visibleViews.every(v => cached(v.id))) message = 'À jour — toutes les cartes visibles sont en cache.';
-    else message = 'Chargement manuel — utiliser ↻ sur une carte.';
+    else if (visibleViews.every(v => cached(v.id))) {
+      message = 'À jour — toutes les cartes visibles sont en cache.';
+      if (settings.autoNext) {
+        const pagination = collectionPagination();
+        if (pagination && !pagination.loading && pagination.page < pagination.total) {
+          const remaining = Math.max(0, nextRequestAt(g, settings) - now);
+          detail = `Passage automatique à la page ${pagination.page + 1} / ${pagination.total}${remaining ? ` dans ${format(Math.ceil(remaining / 100) / 10)} s` : ' en attente'}.`;
+        } else if (pagination && !pagination.loading) detail = 'Dernière page atteinte. Les cartes hors écran ne sont pas chargées.';
+      }
+    } else message = 'Chargement manuel — utiliser ↻ sur une carte.';
     const setText = (selector, text) => {
       const node = controls.querySelector(selector);
       if (node.textContent !== text) node.textContent = text;
@@ -530,6 +583,7 @@
     const count = currentViews.filter(v => cached(v.id)).length;
     setText('.wm-sync-progress', `${count} / ${currentViews.length} cartes de cette page en cache`);
     controls.querySelector('[role="switch"]').checked = settings.enabled;
+    controls.querySelector('.wm-sync-auto-next input').checked = settings.autoNext;
     const slider = controls.querySelector('input[type="range"]');
     slider.value = String(settings.intervalMs / 1000);
     slider.setAttribute('aria-valuetext', `${format(settings.intervalMs / 1000)} secondes après chaque réponse`);
@@ -603,19 +657,105 @@
     return view ? { id: view.id, requested: 0 } : null;
   }
 
+  function collectionPagination() {
+    // Les deux paginations natives (haut et bas) pilotent le même état React.
+    // N'utiliser qu'un bouton, sans recréer les requêtes ni toucher aux filtres.
+    for (const next of document.querySelectorAll('main button')) {
+      if (!/^Suivant(?:\s*→)?$/.test(next.textContent.trim())) continue;
+      const label = [...next.parentElement.querySelectorAll('span')]
+        .map(el => el.textContent.trim().match(/^Page\s+(\d+)\s*\/\s*(\d+)$/)).find(Boolean);
+      if (label) return { next, page: Number(label[1]), total: Number(label[2]), loading: false };
+      if (next.disabled) return { next, loading: true };
+    }
+    return null;
+  }
+  function visibleCardNodes() {
+    return [...document.querySelectorAll('main h3')].map(heading => heading.closest('div.cursor-pointer'))
+      .filter(node => node?.parentElement?.classList.contains('group') && visible({ node, cardNode: node }));
+  }
+  function nextPageReady() {
+    const pagination = collectionPagination();
+    const modal = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], .fixed h2')]
+      .some(el => el.getClientRects().length > 0);
+    if (!syncSettings().autoNext || pageError || collectionLoads.size || modal || !pagination
+        || pagination.loading || pagination.page >= pagination.total || pagination.next.disabled) {
+      pageCandidate = null;
+      return null;
+    }
+    const nodes = visibleCardNodes();
+    // Une carte visible non reconnue ou en erreur doit empêcher de sauter la page.
+    // Les cartes hors du viewport ne font pas partie de cette vérification.
+    if (!nodes.length || nodes.some(node => {
+      const view = views.get(node);
+      const info = cardInfo(node.querySelector('h3'), node);
+      return !view || !info || view.id !== info.id || !cached(view.id) || failures.has(view.id) || manual.has(view.id);
+    })) { pageCandidate = null; return null; }
+    const signature = JSON.stringify([pagination.page, pagination.total, ...nodes.map(node => views.get(node).id)]);
+    if (pageCandidate?.signature !== signature) pageCandidate = { signature, since: Date.now() };
+    // Laisser le rendu et le défilement natifs se stabiliser avant le clic.
+    return Date.now() - pageCandidate.since >= 500 ? pagination : null;
+  }
+  async function advanceCollectionPage(pagination) {
+    const target = pagination.page + 1;
+    const beforeSerial = collectionSerial;
+    const started = Date.now();
+    const expiresAt = started + REQUEST_TIMEOUT_MS + 1000;
+    if (!write(GATE_KEY, { ...gate(), waitFrom: 0,
+      request: { kind: 'page', title: `Page ${target} / ${pagination.total}`, expiresAt },
+      next: expiresAt + syncSettings().intervalMs })) return;
+    activePage = target;
+    pageCandidate = null;
+    renderControls();
+    try {
+      pagination.next.click();
+      let settledSince = 0;
+      while (Date.now() - started < REQUEST_TIMEOUT_MS) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (location.pathname !== '/collection') return;
+        const load = lastCollectionLoad;
+        if (load?.serial > beforeSerial && load.done) {
+          if (!load.ok) throw new Error('Le chargement de la page a échoué.');
+          if (load.page !== target) throw new Error('La collection a changé pendant le passage de page.');
+          const current = collectionPagination();
+          if (!collectionLoads.size && current && !current.loading && current.page === target) {
+            settledSince ||= Date.now();
+            if (Date.now() - settledSince >= 500) { scan(); return; }
+          } else settledSince = 0;
+        }
+      }
+      throw new Error('La nouvelle page ne répond pas ou son affichage n’a pas pu être confirmé.');
+    } catch (error) {
+      pageError = error.message || 'Le changement de page a échoué.';
+    } finally {
+      // Le même verrou couvre le clic et la réponse native complète. Le délai
+      // repart seulement ensuite, même si la prochaine page est déjà en cache.
+      const finished = Date.now();
+      write(GATE_KEY, { ...gate(), request: null, waitFrom: finished,
+        next: finished + syncSettings().intervalMs });
+      activePage = null;
+      renderAll();
+    }
+  }
+
   async function pump() {
-    if (!syncSettings().enabled || automationBlocked() || busy || !storageOK || !navigator.locks || document.hidden || location.pathname !== '/collection') return;
+    const settings = syncSettings();
+    if (!settings.enabled || (settings.autoNext && pageError) || automationBlocked() || busy || collectionLoads.size || !storageOK || !navigator.locks || document.hidden || location.pathname !== '/collection') return;
     const g = gate();
-    if (Date.now() < Math.max(nextRequestAt(g), g.until, g.retryAfterUntil) || !choose()) return;
+    if (Date.now() < Math.max(nextRequestAt(g), g.until, g.retryAfterUntil) || (!choose() && !nextPageReady())) return;
     busy = true;
     try {
       // ifAvailable évite d'accumuler une file d'onglets en attente.
       await navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
-        if (!lock || !syncSettings().enabled || automationBlocked() || !storageOK || document.hidden || location.pathname !== '/collection') return;
+        const settings = syncSettings();
+        if (!lock || !settings.enabled || (settings.autoNext && pageError) || automationBlocked() || collectionLoads.size || !storageOK || document.hidden || location.pathname !== '/collection') return;
         const current = gate();
         if (Date.now() < Math.max(nextRequestAt(current), current.until, current.retryAfterUntil)) return;
         const job = choose(); // Relire le cache APRES avoir obtenu le verrou.
-        if (!job) return;
+        if (!job) {
+          const pagination = nextPageReady();
+          if (pagination) await advanceCollectionPage(pagination);
+          return;
+        }
         const started = Date.now();
         const title = [...views.values()].find(v => v.id === job.id)?.title || 'Carte';
         // Réservation conservatrice si l'onglet est fermé avant le finally.
@@ -678,6 +818,7 @@
       .wm-sync-toggle input{appearance:none;position:relative;flex:none;width:34px;height:20px;margin:0;border:1px solid #ffffff40;border-radius:20px;background:#344039;cursor:pointer}
       .wm-sync-toggle input:after{content:'';position:absolute;left:3px;top:3px;width:12px;height:12px;border-radius:50%;background:#d8e6df}
       .wm-sync-toggle input:checked{background:#1c7858;border-color:#39e2a8}.wm-sync-toggle input:checked:after{left:17px;background:#fff}
+      .wm-sync-auto-next{display:flex;align-items:flex-start;gap:8px;cursor:pointer}.wm-sync-auto-next input{flex:none;margin:3px 0 0;accent-color:#39e2a8}.wm-sync-auto-next span{min-width:0}
       .wm-sync-delay{display:flex;flex-direction:column;gap:6px}.wm-sync-delay>span{display:flex;justify-content:space-between;gap:12px}.wm-sync-delay output{font-weight:700;color:#a4eccf;white-space:nowrap}
       .wm-sync-delay input{width:100%;min-width:0;margin:0;accent-color:#39e2a8;cursor:pointer}
       .wm-market-controls input:focus-visible{outline:2px solid #39e2a8;outline-offset:3px}
@@ -718,15 +859,22 @@
         filterNotifications();
       }
       if (e.key === SETTINGS_KEY && !syncSettings().enabled) manual.clear();
+      if (e.key === SETTINGS_KEY) {
+        pageCandidate = null;
+        if (!syncSettings().autoNext) pageError = '';
+      }
       const revision = gate().resumeRevision;
       if (revision > lastResumeRevision) {
         lastResumeRevision = revision;
         failures.clear();
         manual.clear();
+        pageError = '';
+        pageCandidate = null;
       }
       renderAll();
     });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) { scheduleScan(); void pump(); } });
+    document.addEventListener('scroll', () => { pageCandidate = null; }, { capture: true, passive: true });
     // Contrôle local, sans appel réseau : gère aussi pagination et navigation SPA.
     setInterval(renderAll, 1000);
     setInterval(() => { renderControls(); void pump(); }, 250);
