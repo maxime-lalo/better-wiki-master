@@ -1,0 +1,11 @@
+node_modules/
+.DS_Store
+.env
+.env.*
+test-results/
+playwright-report/
+# Notes et captures issues de la session personnelle de développement.
+LOCAL-NOTES.md
+rate-probe-result.json
+preview-*.png
+auction-integration-test.js
