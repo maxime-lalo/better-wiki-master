@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters — Prix de la collection
 // @namespace    local.wikimasters.collection
-// @version      1.6.0
+// @version      1.6.1
 // @description  Prix en cache, filtres des notifications et mise aux enchères sans quitter la collection.
 // @author       maxime-lalo
 // @license      MIT
@@ -121,6 +121,10 @@
     if ((cached(id)?.fetchedAt || 0) > fetchedAt) return true;
     const ok = write(PREFIX + id, { version: 1, fetchedAt, summary: data.summary, source });
     if (ok) failures.delete(id);
+    const currentGate = gate();
+    if (ok && currentGate.retry?.id === id && (!currentGate.retry.requested || fetchedAt > currentGate.retry.requested)) {
+      write(GATE_KEY, { ...currentGate, retry: null });
+    }
     if (ok && source === 'site') queueContribution(id, { fetchedAt, summary: data.summary });
     if (!quiet) renderAll();
     return ok;
@@ -151,6 +155,8 @@
     const request = g?.request;
     return { next: Number(g?.next) || 0, until: Number(g?.until) || 0,
       waitFrom: Number(g?.waitFrom) || 0,
+      retry: UUID.test(g?.retry?.id) && Number.isFinite(g.retry.requested) && typeof g.retry.message === 'string'
+        ? g.retry : null,
       request: (UUID.test(request?.id) || request?.kind === 'page') && typeof request.title === 'string'
         && Number.isFinite(request.expiresAt) ? request : null,
       retryAfterUntil: Number(g?.retryAfterUntil) || 0, resumeRevision: Number(g?.resumeRevision) || 0 };
@@ -647,6 +653,7 @@
     const blocked = automationBlocked();
     const state = blocked ? 'Appels refusés par le site' : !storageOK ? 'Stockage indisponible' : !navigator.locks ? 'Web Locks indisponible'
       : pending ? 'Chargement…' : !settings.enabled ? 'Synchronisation désactivée' : paused ? 'Pause API' : error ? 'Échec · réessayer ↻'
+      : g.retry?.id === view.id ? `${g.retry.message} · nouvel essai prévu`
       : entry ? `${entry.source === 'shared' ? 'Partagé · ' : ''}${new Date(entry.fetchedAt).toLocaleDateString('fr-FR')}` : 'Non chargé';
     const signature = JSON.stringify([entry, state, pending, paused, blocked, settings.enabled]);
     if (view.signature === signature) return;
@@ -796,10 +803,10 @@
     else if (settings.sharedEnabled && shared.busy) message = 'Synchronisation du cache partagé…';
     else if (job) {
       const remaining = Math.max(0, nextRequestAt(g, settings) - now);
-      message = remaining ? 'En attente du prochain chargement.' : 'Synchronisation prête.';
+      message = job.retry ? 'Nouvel essai automatique prévu.' : remaining ? 'En attente du prochain chargement.' : 'Synchronisation prête.';
       const title = currentViews.find(v => v.id === job.id)?.title || 'Carte';
-      detail = remaining ? `Prochaine carte : ${title} · dans ${format(Math.ceil(remaining / 100) / 10)} s.`
-        : `Prochaine carte : ${title}.`;
+      const prefix = job.retry ? `${g.retry.message} — réessayer ${title}` : `Prochaine carte : ${title}`;
+      detail = remaining ? `${prefix} · dans ${format(Math.ceil(remaining / 100) / 10)} s.` : `${prefix}.`;
     } else if (errors) message = 'Chargement arrêté — certains prix sont en erreur.';
     else if (unknownCards) message = 'Certaines cartes de cette page n’ont pas pu être identifiées.';
     else if (!pageViews.length) message = 'En attente de cartes à synchroniser sur cette page.';
@@ -895,6 +902,12 @@
     if (!syncSettings().enabled) return null;
     const candidates = [...views.values()].filter(onCollectionPage);
     const waiting = id => syncSettings().sharedEnabled && (shared.waiting.get(id) || 0) > Date.now();
+    const currentGate = gate(), retry = currentGate.retry;
+    if (retry && candidates.some(view => view.id === retry.id)) {
+      const entry = cached(retry.id);
+      if (entry && (!retry.requested || entry.fetchedAt > retry.requested)) write(GATE_KEY, { ...currentGate, retry: null });
+      else return waiting(retry.id) ? null : { id: retry.id, requested: retry.requested, retry: true };
+    }
     for (const [id, requested] of manual) {
       if (!candidates.some(v => v.id === id)) { manual.delete(id); continue; }
       if ((cached(id)?.fetchedAt || 0) > requested) { manual.delete(id); continue; }
@@ -937,7 +950,8 @@
     if (!nodes.length || nodes.some(node => {
       const view = views.get(node);
       const info = cardInfo(node.querySelector('h3'), node);
-      return !view || !info || view.id !== info.id || !cached(view.id) || failures.has(view.id) || manual.has(view.id);
+      return !view || !info || view.id !== info.id || !cached(view.id) || failures.has(view.id) || manual.has(view.id)
+        || gate().retry?.id === view.id;
     })) { pageCandidate = null; return null; }
     const signature = JSON.stringify([pagination.page, pagination.total, ...nodes.map(node => views.get(node).id)]);
     if (pageCandidate?.signature !== signature) pageCandidate = { signature, since: Date.now() };
@@ -1033,21 +1047,41 @@
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
         let success = false;
+        let transient = false, retryMessage = '', retryAfterUntil = 0;
         try {
           const response = await nativeFetch(`/api/marketplace/cards/${job.id}/sales?scope=summary`, {
             credentials: 'same-origin', signal: controller.signal,
           });
           if (!response.ok) {
+            if (response.status === 404 || response.status >= 500 && response.status <= 599) {
+              transient = true;
+              retryMessage = `HTTP ${response.status}`;
+              const header = response.headers.get('Retry-After');
+              if (header !== null) {
+                const seconds = Number(header);
+                retryAfterUntil = Number.isFinite(seconds) ? Date.now() + Math.max(0, seconds) * 1000 : Date.parse(header) || 0;
+              }
+              // Attendre le corps d'erreur aussi : le délai commence seulement
+              // une fois cette tentative terminée, jamais dès les en-têtes.
+              await response.text();
+              throw new Error(retryMessage);
+            }
             await pause(response);
             throw new Error(`HTTP ${response.status}. Appels temporairement suspendus.`);
           }
           if (!save(job.id, await response.json())) throw new Error('Réponse invalide ou cache indisponible.');
           success = true;
         } catch (error) {
-          failures.set(job.id, error.message || 'Erreur réseau.');
-          // Aucun réessai automatique sur cette carte. Les anciennes valeurs restent visibles.
           const currentGate = gate();
-          write(GATE_KEY, { ...currentGate, until: Math.max(currentGate.until, Date.now() + 60_000) });
+          if (transient || error.name === 'AbortError' || error.name === 'TimeoutError' || error instanceof TypeError) {
+            failures.delete(job.id);
+            write(GATE_KEY, { ...currentGate,
+              retry: { id: job.id, requested: job.requested, message: retryMessage || 'Erreur réseau' },
+              retryAfterUntil: Math.max(currentGate.retryAfterUntil, retryAfterUntil) });
+          } else {
+            failures.set(job.id, error.message || 'Erreur réseau.');
+            write(GATE_KEY, { ...currentGate, retry: null, until: Math.max(currentGate.until, Date.now() + 60_000) });
+          }
         } finally {
           clearTimeout(timer);
           // Fin réelle : corps JSON reçu, traité ou en erreur. Le verrou est

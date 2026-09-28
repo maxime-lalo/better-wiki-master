@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters — Prix de la collection
 // @namespace    local.wikimasters.collection
-// @version      1.6.0
+// @version      1.6.1
 // @description  Prix en cache, filtres des notifications et mise aux enchères sans quitter la collection.
 // @author       maxime-lalo
 // @license      MIT
