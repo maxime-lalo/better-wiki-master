@@ -4,7 +4,7 @@ Un userscript pour améliorer la collection et les notifications sur **[WikiMast
 
 **Projet indépendant, sans affiliation avec WikiMasters.** Le logiciel est fourni en l'état, sous [licence MIT](LICENSE), avec exclusion de garantie et limitation de responsabilité dans les limites de la loi. Lire la [notice d'usage et de responsabilité](NOTICE.md) avant installation.
 
-> **Autorisation du service :** le [règlement de WikiMasters](https://www.wiki-masters.com/rules) interdit l'automatisation et l'interception du trafic pour obtenir un avantage. La licence du code ne donne pas l'autorisation d'utiliser ces fonctions sur le jeu. Demandez l'accord de l'éditeur avant usage ; le délai d'une seconde ne garantit ni conformité ni absence de sanction.
+> **Autorisation du service :** le [règlement de WikiMasters](https://www.wiki-masters.com/rules) interdit l'automatisation et l'interception du trafic pour obtenir un avantage. La licence du code ne donne pas l'autorisation d'utiliser ces fonctions sur le jeu. Demandez l'accord de l'éditeur avant usage ; un délai entre les requêtes ne garantit ni conformité ni absence de sanction.
 
 **[Installer le script](https://raw.githubusercontent.com/maxime-lalo/better-wiki-master/main/wiki-masters-market.user.js)** · [Voir le code](wiki-masters-market.user.js) · [Signaler un problème](https://github.com/maxime-lalo/better-wiki-master/issues)
 
@@ -22,7 +22,8 @@ Les améliorations s'appliquent au site ouvert dans ce navigateur. Elles ne s'in
 
 - **Prix sur les cartes** : prix moyen, dernière vente et nombre de ventes, selon la rareté effective et les données du formulaire de mise aux enchères.
 - **Cache sans expiration** : les données déjà récupérées sont réutilisées. Le bouton **↻** actualise une carte ; sa date de consultation reste visible.
-- **Chargement progressif** : prix manquants des cartes visibles, une requête à la fois avec au moins une seconde entre les départs, partagée entre les onglets. Pas de parcours automatique des autres pages.
+- **Bandeau permanent** : reste visible sur la collection et pendant le défilement, avec l'état, le nom de la carte en cours, la prochaine carte, le compte à rebours et le nombre de cartes de la page en cache.
+- **Chargement progressif** : prix manquants des cartes visibles, une seule requête à la fois entre tous les onglets. Le délai réglable commence **après réception et traitement complets de la réponse précédente**, pas au départ de la requête. Pas de parcours automatique des autres pages.
 - **Pauses API** : arrêt sur les erreurs prévues, prise en compte de `Retry-After` et bouton de reprise manuelle. Le cache reste consultable pendant l'arrêt.
 - **Notifications filtrables** : choix d'un type, compteurs et mémorisation du filtre. Le filtre porte sur les notifications déjà chargées, sans requête supplémentaire.
 - **Mise aux enchères sur place** : après succès, fermeture du formulaire et du détail, retrait du seul exemplaire concerné, conservation des filtres et de la page, sans rechargement global de la collection.
@@ -88,7 +89,15 @@ Le cache est local au navigateur et à l'appareil. Effacer les données du site 
 | Prix anciens ou manquants | Cache sans expiration, absence de ventes, accès refusé ou données indisponibles pour le compte. Le comportement non Pro n'a pas été validé. |
 | Redirection revenue après une mise en vente | Le site a peut-être changé. Le script garde le flux natif si son adaptation ne reconnaît plus la structure du formulaire. |
 
-Pour désactiver le chargement automatique des prix, remplacer `const AUTO_LOAD = true` par `false` dans le script. Les boutons manuels restent soumis aux mêmes pauses. Une mise à jour peut écraser cette modification locale.
+### Contrôler la synchronisation
+
+Le bandeau de collection propose un interrupteur **Synchronisation des prix** et un curseur **Délai après chaque réponse**, de **1 à 30 secondes**, par pas de 0,5 seconde ; le réglage initial est d'une seconde.
+
+Exemple : avec un délai de 3 secondes et une réponse de la carte A qui prend 2 secondes, la carte B pourra partir au plus tôt 5 secondes après le départ de A. Le corps JSON doit être entièrement reçu avant que l'attente commence. Si le délai change pendant l'attente, le temps déjà écoulé depuis la dernière réponse est conservé.
+
+Désactiver la synchronisation empêche les prochains appels du script, y compris les actualisations ↻. Une requête déjà en cours termine et alimente le cache ; les consultations natives du site continuent normalement. Réactiver reprend les prix manquants visibles en respectant le délai restant et les pauses serveur. Cela ne lève pas un arrêt `automation_limit` : le bouton de reprise existant reste distinct.
+
+L'interrupteur et le délai sont conservés entre visites et partagés entre les onglets du même navigateur. Le bandeau indique aussi la carte chargée dans un autre onglet. Après mise à jour, recharger les anciens onglets pour qu'ils utilisent tous cette coordination. Les états **À jour**, **Désactivée**, **En cours**, **En attente** et **En pause** restent affichés même quand aucun appel n'est lancé.
 
 ## Confidentialité et limites
 
@@ -106,7 +115,7 @@ npx playwright install chromium
 npm test
 ```
 
-Les trois suites utilisent des pages isolées et des réponses réseau simulées : **34 assertions pour les prix, 15 pour les notifications et 23 pour les enchères**. Aucun compte WikiMasters n'est nécessaire et aucune enchère réelle n'est créée.
+Les quatre suites utilisent des pages isolées et des réponses réseau simulées : **34 assertions pour les prix, 15 pour les notifications, 23 pour les enchères et 30 pour la synchronisation**. Les contrôles couvrent notamment les réponses lentes dont le corps arrive après les en-têtes, le délai entre deux onglets, les réglages persistants, l'arrêt pendant une requête et le maintien des pauses serveur. Aucun compte WikiMasters n'est nécessaire et aucune enchère réelle n'est créée.
 
 Une vérification séparée sur l'interface réelle avec soumission simulée a également contrôlé la conservation de la page, des filtres et des autres cartes. Les extensions elles-mêmes et les installations physiques Android/iOS restent à valider ; un écran de 390 px n'est pas un test sur téléphone.
 

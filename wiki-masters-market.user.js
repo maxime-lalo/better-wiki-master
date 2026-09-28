@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters — Prix de la collection
 // @namespace    local.wikimasters.collection
-// @version      1.3.1
+// @version      1.4.0
 // @description  Prix en cache, filtres des notifications et mise aux enchères sans quitter la collection.
 // @author       maxime-lalo
 // @license      MIT
@@ -55,13 +55,17 @@
   if (window.__wmMarketInstalled) return;
   window.__wmMarketInstalled = true;
 
-  // Une seule requête à la fois, espacée d'au moins 1 s entre tous les onglets.
+  // Une seule requête à la fois ; le délai commence après sa réponse complète.
   // Mettre false pour charger uniquement avec le bouton ↻.
   const AUTO_LOAD = true;
-  const INTERVAL_MS = 1000;
+  const DEFAULT_INTERVAL_MS = 1000;
+  const MIN_INTERVAL_MS = 1000;
+  const MAX_INTERVAL_MS = 30000;
+  const REQUEST_TIMEOUT_MS = 20000;
   const PREFIX = 'wm-market-v1:';
   const GATE_KEY = PREFIX + 'gate';
   const BLOCK_KEY = PREFIX + 'automation-block';
+  const SETTINGS_KEY = PREFIX + 'sync-settings';
   const NOTIFICATION_FILTER_KEY = PREFIX + 'notification-filter';
   const LOCK = PREFIX + 'request';
   const RARITIES = ['C', 'PC', 'R', 'SR', 'UR', 'L'];
@@ -112,10 +116,33 @@
     return ok;
   }
   function automationBlocked() { return read(BLOCK_KEY)?.code === 'automation_limit'; }
+  function syncSettings() {
+    const saved = read(SETTINGS_KEY);
+    const intervalMs = Number.isFinite(saved?.intervalMs)
+      ? Math.round(saved.intervalMs / 500) * 500 : DEFAULT_INTERVAL_MS;
+    return { enabled: typeof saved?.enabled === 'boolean' ? saved.enabled : true,
+      intervalMs: Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS, intervalMs)) };
+  }
+  function setSyncSettings(update) {
+    const settings = { ...syncSettings(), ...update };
+    if (!write(SETTINGS_KEY, settings)) { renderAll(); return; }
+    if (!settings.enabled) manual.clear();
+    renderAll();
+    void pump();
+  }
   function gate() {
     const g = read(GATE_KEY);
+    const request = g?.request;
     return { next: Number(g?.next) || 0, until: Number(g?.until) || 0,
+      waitFrom: Number(g?.waitFrom) || 0,
+      request: UUID.test(request?.id) && typeof request.title === 'string'
+        && Number.isFinite(request.expiresAt) ? request : null,
       retryAfterUntil: Number(g?.retryAfterUntil) || 0, resumeRevision: Number(g?.resumeRevision) || 0 };
+  }
+  function nextRequestAt(g, settings = syncSettings()) {
+    // Recalculer depuis la fin de la requête précédente permet de modifier le
+    // curseur pendant le compte à rebours, sans remettre le compteur à zéro.
+    return g.waitFrom ? g.waitFrom + settings.intervalMs : g.next;
   }
   async function pause(response) {
     if (response.status === 403) {
@@ -375,24 +402,26 @@
   function render(view) {
     const entry = cached(view.id);
     const stats = entry?.summary[view.rarity];
-    const pending = activeId === view.id || manual.has(view.id);
     const g = gate();
+    const settings = syncSettings();
+    const pending = activeId === view.id || manual.has(view.id)
+      || (g.request?.id === view.id && g.request.expiresAt > Date.now());
     const paused = g.until > Date.now();
     const error = failures.get(view.id);
     const blocked = automationBlocked();
     const state = blocked ? 'Appels refusés par le site' : !storageOK ? 'Stockage indisponible' : !navigator.locks ? 'Web Locks indisponible'
-      : pending ? 'Chargement…' : paused ? 'Pause API' : error ? 'Échec · réessayer ↻'
+      : pending ? 'Chargement…' : !settings.enabled ? 'Synchronisation désactivée' : paused ? 'Pause API' : error ? 'Échec · réessayer ↻'
       : entry ? new Date(entry.fetchedAt).toLocaleDateString('fr-FR') : 'Non chargé';
-    const signature = JSON.stringify([entry, state, pending, paused, blocked]);
+    const signature = JSON.stringify([entry, state, pending, paused, blocked, settings.enabled]);
     if (view.signature === signature) return;
     view.signature = signature;
     view.mean.textContent = entry ? stats ? format(stats.average) : '—' : '…';
     view.last.textContent = entry ? stats ? format(stats.latest) : '—' : '…';
     view.count.textContent = entry ? `${format(stats?.count ?? 0)} vente${stats?.count === 1 ? '' : 's'}` : 'Ventes : …';
     view.date.textContent = state;
-    view.button.disabled = blocked || pending || paused || !storageOK || !navigator.locks;
+    view.button.disabled = !settings.enabled || blocked || pending || paused || !storageOK || !navigator.locks;
     view.button.textContent = pending ? '…' : '↻';
-    view.button.title = blocked ? 'WikiMasters a refusé l’automatisation (automation_limit). Le cache reste consultable.' : paused ? `Appels suspendus jusqu'au ${new Date(g.until).toLocaleString('fr-FR')}`
+    view.button.title = !settings.enabled ? 'Activer la synchronisation dans le bandeau pour actualiser ce prix.' : blocked ? 'WikiMasters a refusé l’automatisation (automation_limit). Le cache reste consultable.' : paused ? `Appels suspendus jusqu'au ${new Date(g.until).toLocaleString('fr-FR')}`
       : 'Actualiser moyenne, dernière vente et nombre de ventes';
     view.node.title = [
       `Marché · ${view.rarity} · prix en WikiBidous`,
@@ -404,16 +433,17 @@
   function renderAll() { for (const view of views.values()) render(view); renderControls(); }
 
   async function resumeLoading() {
-    if (resuming || !storageOK || !navigator.locks || gate().retryAfterUntil > Date.now()) return;
+    if (resuming || !syncSettings().enabled || !storageOK || !navigator.locks || gate().retryAfterUntil > Date.now()) return;
     resuming = true;
     renderControls();
     try {
       // Attend la fin de la requête en cours avant de réarmer la file.
       await navigator.locks.request(LOCK, async () => {
         const g = gate();
-        if (g.retryAfterUntil > Date.now()) return;
-        const next = { ...g, until: 0, retryAfterUntil: 0,
-          next: Math.max(g.next, Date.now() + INTERVAL_MS), resumeRevision: g.resumeRevision + 1 };
+        if (!syncSettings().enabled || g.retryAfterUntil > Date.now()) return;
+        const waitFrom = Date.now();
+        const next = { ...g, until: 0, retryAfterUntil: 0, request: null, waitFrom,
+          next: waitFrom + syncSettings().intervalMs, resumeRevision: g.resumeRevision + 1 };
         if (!write(GATE_KEY, next) || !write(BLOCK_KEY, null)) return;
         lastResumeRevision = next.resumeRevision;
         failures.clear();
@@ -431,30 +461,88 @@
       controls = document.createElement('div');
       controls.id = 'wm-market-controls';
       controls.className = 'wm-market-controls';
-      controls.innerHTML = '<span role="status"></span><button type="button">Reprendre le chargement</button>';
-      controls.querySelector('button').addEventListener('click', () => { void resumeLoading(); });
+      controls.innerHTML = `<div class="wm-sync-summary">
+        <strong class="wm-sync-status" role="status" aria-live="polite"></strong>
+        <span class="wm-sync-detail"></span><span class="wm-sync-progress"></span>
+      </div><div class="wm-sync-settings">
+        <label class="wm-sync-toggle"><input type="checkbox" role="switch" aria-label="Synchronisation des prix"><span>Synchronisation des prix</span></label>
+        <label class="wm-sync-delay" for="wm-sync-delay"><span>Délai après chaque réponse <output></output></span>
+          <input id="wm-sync-delay" type="range" min="1" max="30" step="0.5" aria-label="Délai après chaque réponse (secondes)">
+        </label>
+        <button class="wm-sync-resume" type="button">Reprendre le chargement</button>
+      </div>`;
+      controls.querySelector('[role="switch"]').addEventListener('change', event => {
+        setSyncSettings({ enabled: event.target.checked });
+      });
+      controls.querySelector('input[type="range"]').addEventListener('input', event => {
+        setSyncSettings({ intervalMs: Number(event.target.value) * 1000 });
+      });
+      controls.querySelector('.wm-sync-resume').addEventListener('click', () => { void resumeLoading(); });
       const heading = main.querySelector('h1');
       if (heading?.parentElement && heading.parentElement !== main) heading.parentElement.insertAdjacentElement('afterend', controls);
       else main.prepend(controls);
     }
     const g = gate();
-    const waitingForServer = g.retryAfterUntil > Date.now();
-    const paused = automationBlocked() || g.until > Date.now() || failures.size > 0;
-    controls.hidden = !paused && !resuming;
-    const button = controls.querySelector('button');
-    button.disabled = resuming || busy || waitingForServer || !storageOK || !navigator.locks;
-    const label = resuming ? 'Reprise…' : 'Reprendre le chargement';
-    if (button.textContent !== label) button.textContent = label;
-    const message = waitingForServer
-      ? `Pause demandée par le serveur jusqu’au ${new Date(g.retryAfterUntil).toLocaleString('fr-FR')}.`
-      : 'Chargement arrêté. Les prix en cache sont conservés.';
-    const status = controls.querySelector('span');
-    if (status.textContent !== message) status.textContent = message;
+    const settings = syncSettings();
+    const now = Date.now();
+    const waitingForServer = g.retryAfterUntil > now;
+    const blocked = automationBlocked();
+    const paused = blocked || g.until > now || waitingForServer;
+    const request = g.request?.expiresAt > now ? g.request : null;
+    const job = choose();
+    const currentViews = [...views.values()].filter(v => v.node.isConnected);
+    const visibleViews = currentViews.filter(visible);
+    const errors = currentViews.some(v => failures.has(v.id));
+    let message;
+    let detail = 'Les prix en cache sont conservés.';
+    if (request) {
+      message = `Synchronisation en cours — ${request.title}${activeId === request.id ? '' : ' (autre onglet)'}`;
+      if (!settings.enabled) detail = 'Arrêt demandé : cette requête se termine, puis aucun autre appel ne sera lancé.';
+      else detail = 'Le délai commencera après réception complète de cette réponse.';
+    } else if (!storageOK) message = 'Synchronisation indisponible — stockage local inaccessible.';
+    else if (!navigator.locks) message = 'Synchronisation indisponible — Web Locks indisponible.';
+    else if (!settings.enabled) message = 'Synchronisation désactivée.';
+    else if (resuming) message = 'Reprise du chargement…';
+    else if (waitingForServer) {
+      message = 'Synchronisation en pause — délai demandé par le serveur.';
+      detail = `Reprise possible à partir du ${new Date(g.retryAfterUntil).toLocaleString('fr-FR')}.`;
+    } else if (blocked) message = 'Chargement arrêté — appels refusés par le site.';
+    else if (paused) {
+      message = 'Synchronisation en pause après une erreur.';
+      detail = `Pause jusqu’au ${new Date(g.until).toLocaleString('fr-FR')}. Les prix en cache sont conservés.`;
+    } else if (document.hidden) message = 'Synchronisation en attente — onglet non visible.';
+    else if (job) {
+      const remaining = Math.max(0, nextRequestAt(g, settings) - now);
+      message = remaining ? 'En attente du prochain chargement.' : 'Synchronisation prête.';
+      const title = currentViews.find(v => v.id === job.id)?.title || 'Carte';
+      detail = remaining ? `Prochaine carte : ${title} · dans ${format(Math.ceil(remaining / 100) / 10)} s.`
+        : `Prochaine carte : ${title}.`;
+    } else if (errors) message = 'Chargement arrêté — certains prix sont en erreur.';
+    else if (!visibleViews.length) message = 'En attente de cartes visibles à synchroniser.';
+    else if (visibleViews.every(v => cached(v.id))) message = 'À jour — toutes les cartes visibles sont en cache.';
+    else message = 'Chargement manuel — utiliser ↻ sur une carte.';
+    const setText = (selector, text) => {
+      const node = controls.querySelector(selector);
+      if (node.textContent !== text) node.textContent = text;
+    };
+    setText('.wm-sync-status', message);
+    setText('.wm-sync-detail', detail);
+    const count = currentViews.filter(v => cached(v.id)).length;
+    setText('.wm-sync-progress', `${count} / ${currentViews.length} cartes de cette page en cache`);
+    controls.querySelector('[role="switch"]').checked = settings.enabled;
+    const slider = controls.querySelector('input[type="range"]');
+    slider.value = String(settings.intervalMs / 1000);
+    slider.setAttribute('aria-valuetext', `${format(settings.intervalMs / 1000)} secondes après chaque réponse`);
+    setText('output', `${format(settings.intervalMs / 1000)} s`);
+    const button = controls.querySelector('.wm-sync-resume');
+    button.hidden = !paused && !errors && !resuming;
+    button.disabled = !settings.enabled || resuming || busy || !!request || waitingForServer || !storageOK || !navigator.locks;
+    setText('.wm-sync-resume', resuming ? 'Reprise…' : 'Reprendre le chargement');
     button.title = waitingForServer ? 'Le délai Retry-After doit être écoulé.'
-      : 'Réessayer les prix manquants, à une requête par seconde. Un nouveau refus arrêtera les appels.';
+      : 'Réessayer les prix manquants avec le délai choisi. Un nouveau refus arrêtera les appels.';
   }
   function requestRefresh(view) {
-    if (automationBlocked() || activeId === view.id || manual.has(view.id) || gate().until > Date.now()) return;
+    if (!syncSettings().enabled || automationBlocked() || activeId === view.id || manual.has(view.id) || gate().until > Date.now()) return;
     failures.delete(view.id);
     // Si un autre onglet actualise après ce clic, sa réponse suffira.
     manual.set(view.id, Date.now());
@@ -503,6 +591,7 @@
     scanTimer = setTimeout(scan, 120);
   }
   function choose() {
+    if (!syncSettings().enabled) return null;
     const candidates = [...views.values()].filter(visible);
     for (const [id, requested] of manual) {
       if (!candidates.some(v => v.id === id)) { manual.delete(id); continue; }
@@ -515,23 +604,28 @@
   }
 
   async function pump() {
-    if (automationBlocked() || busy || !storageOK || !navigator.locks || document.hidden || location.pathname !== '/collection') return;
+    if (!syncSettings().enabled || automationBlocked() || busy || !storageOK || !navigator.locks || document.hidden || location.pathname !== '/collection') return;
     const g = gate();
-    if (Date.now() < Math.max(g.next, g.until) || !choose()) return;
+    if (Date.now() < Math.max(nextRequestAt(g), g.until, g.retryAfterUntil) || !choose()) return;
     busy = true;
     try {
       // ifAvailable évite d'accumuler une file d'onglets en attente.
       await navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
-        if (!lock || automationBlocked() || document.hidden || location.pathname !== '/collection') return;
+        if (!lock || !syncSettings().enabled || automationBlocked() || !storageOK || document.hidden || location.pathname !== '/collection') return;
         const current = gate();
-        if (Date.now() < Math.max(current.next, current.until)) return;
+        if (Date.now() < Math.max(nextRequestAt(current), current.until, current.retryAfterUntil)) return;
         const job = choose(); // Relire le cache APRES avoir obtenu le verrou.
         if (!job) return;
-        if (!write(GATE_KEY, { ...current, next: Date.now() + INTERVAL_MS })) return;
+        const started = Date.now();
+        const title = [...views.values()].find(v => v.id === job.id)?.title || 'Carte';
+        // Réservation conservatrice si l'onglet est fermé avant le finally.
+        const expiresAt = started + REQUEST_TIMEOUT_MS + 1000;
+        if (!write(GATE_KEY, { ...current, waitFrom: 0,
+          request: { id: job.id, title, expiresAt }, next: expiresAt + syncSettings().intervalMs })) return;
         activeId = job.id;
         renderAll();
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 20_000);
+        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
         try {
           const response = await nativeFetch(`/api/marketplace/cards/${job.id}/sales?scope=summary`, {
             credentials: 'same-origin', signal: controller.signal,
@@ -548,13 +642,19 @@
           write(GATE_KEY, { ...currentGate, until: Math.max(currentGate.until, Date.now() + 60_000) });
         } finally {
           clearTimeout(timer);
+          // Fin réelle : corps JSON reçu, traité ou en erreur. Le verrou est
+          // encore détenu ; aucun autre onglet ne peut lancer la carte suivante.
+          const finished = Date.now();
+          const latest = gate();
+          write(GATE_KEY, { ...latest, request: null, waitFrom: finished,
+            next: finished + syncSettings().intervalMs });
           manual.delete(job.id);
           activeId = null;
           renderAll();
         }
       });
     } catch (error) { console.warn('[WikiMasters prix]', error); }
-    finally { busy = false; }
+    finally { busy = false; renderControls(); }
   }
 
   function start() {
@@ -570,7 +670,19 @@
       .wm-market button:disabled{opacity:.4;cursor:default}
       .wm-market-bottom{font-size:10px;flex-wrap:wrap}.wm-market-bottom b{font-weight:600}
       .wm-market-date{color:#91a89b;font-size:9px;margin-top:2px;min-height:13px}
-      .wm-market-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 14px;margin:12px 0;border:1px solid #ffffff24;border-radius:10px;background:#111b17;color:#d8e6df;font:12px/1.5 system-ui,sans-serif}
+      .wm-market-controls{box-sizing:border-box;position:sticky;top:12px;z-index:40;width:100%;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:14px 16px;margin:12px 0;border:1px solid #ffffff24;border-radius:10px;background:#111b17;color:#d8e6df;font:12px/1.5 system-ui,sans-serif;max-width:100%}
+      .wm-sync-summary{display:flex;flex:1 1 240px;min-width:0;flex-direction:column;gap:4px;overflow-wrap:anywhere}
+      .wm-sync-status{color:#a4eccf;font-size:13px}.wm-sync-detail{color:#c1d2c8}.wm-sync-progress{color:#91a89b;font-size:11px}
+      .wm-sync-settings{display:flex;flex:0 1 270px;min-width:0;max-width:100%;flex-direction:column;gap:10px}
+      .wm-sync-toggle{display:flex;align-items:center;gap:8px;cursor:pointer}
+      .wm-sync-toggle input{appearance:none;position:relative;flex:none;width:34px;height:20px;margin:0;border:1px solid #ffffff40;border-radius:20px;background:#344039;cursor:pointer}
+      .wm-sync-toggle input:after{content:'';position:absolute;left:3px;top:3px;width:12px;height:12px;border-radius:50%;background:#d8e6df}
+      .wm-sync-toggle input:checked{background:#1c7858;border-color:#39e2a8}.wm-sync-toggle input:checked:after{left:17px;background:#fff}
+      .wm-sync-delay{display:flex;flex-direction:column;gap:6px}.wm-sync-delay>span{display:flex;justify-content:space-between;gap:12px}.wm-sync-delay output{font-weight:700;color:#a4eccf;white-space:nowrap}
+      .wm-sync-delay input{width:100%;min-width:0;margin:0;accent-color:#39e2a8;cursor:pointer}
+      .wm-market-controls input:focus-visible{outline:2px solid #39e2a8;outline-offset:3px}
+      .wm-market-controls [hidden]{display:none!important}
+      @media(max-width:640px){.wm-sync-settings{flex-basis:100%;width:100%}.wm-market-controls{top:56px}}
       .wm-market-controls[hidden]{display:none}
       .wm-market-controls button{border:1px solid #39e2a866;border-radius:7px;padding:7px 11px;color:#a4eccf;background:#39e2a815;cursor:pointer;font:600 12px/1.4 system-ui,sans-serif}
       .wm-market-controls button:disabled{opacity:.45;cursor:default}
@@ -605,6 +717,7 @@
         notificationType = typeof type === 'string' ? type : '';
         filterNotifications();
       }
+      if (e.key === SETTINGS_KEY && !syncSettings().enabled) manual.clear();
       const revision = gate().resumeRevision;
       if (revision > lastResumeRevision) {
         lastResumeRevision = revision;
@@ -616,7 +729,7 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden) { scheduleScan(); void pump(); } });
     // Contrôle local, sans appel réseau : gère aussi pagination et navigation SPA.
     setInterval(renderAll, 1000);
-    setInterval(() => { void pump(); }, 250);
+    setInterval(() => { renderControls(); void pump(); }, 250);
     scan();
   }
   start();
