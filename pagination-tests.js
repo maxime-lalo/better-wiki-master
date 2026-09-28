@@ -1,4 +1,4 @@
-// Parcours par le bouton natif : viewport uniquement, réponses intégralement simulées.
+// Parcours par le bouton natif : toute la page courante, réponses intégralement simulées.
 async (page) => {
   const context = await page.context().browser().newContext({ viewport: { width: 1100, height: 800 } });
   const results = [], errors = [];
@@ -12,7 +12,7 @@ async (page) => {
     window.currentPage=1;window.nextClicks=[];
     window.renderPage=(number)=>{
       window.currentPage=number;document.querySelector('#grid').replaceChildren();
-      for(let i=1;i<=3;i++){
+      for(let i=1;i<=(window.cardsPerPage||3);i++){
         const node=document.createElement('div');node.className='group'+(i===3?' offscreen':'');
         node.innerHTML='<div class="cursor-pointer"><span>L</span><h3></h3></div>';
         const h=node.querySelector('h3');const card=window.card(number,i);h.textContent=card.wikipedia_title;h.__reactFiber$test={memoizedProps:{card}};
@@ -59,7 +59,7 @@ async (page) => {
       const data=kind==='price'?{summary:{L:{average:42,count:2,latest:40}}}:{collection:[1,2,3].map(i=>({card:window.card(call.page,i)}))};
       controller.enqueue(new TextEncoder().encode(JSON.stringify(data)));controller.close();return call.finishedAt;
     };
-    window.cachePage=(number)=>{for(let i=1;i<=2;i++)localStorage.setItem('wm-market-v1:'+window.card(number,i).id,JSON.stringify({version:1,fetchedAt:Date.now(),summary:{}}));};
+    window.cachePage=(number)=>{for(let i=1;i<=3;i++)localStorage.setItem('wm-market-v1:'+window.card(number,i).id,JSON.stringify({version:1,fetchedAt:Date.now(),summary:{}}));};
   ` + page.wikiTestSource });
   const p = await context.newPage();
   p.setDefaultTimeout(5000);
@@ -82,30 +82,32 @@ async (page) => {
   try {
     await p.clock.install();await p.goto('https://www.wiki-masters.com/collection');await advance(300);
     assert(!await option().isChecked(), 'Case exacte présente et désactivée par défaut');
-    assert((await calls()).length===1, 'Une seule carte visible démarre');
+    assert((await calls()).length===1, 'Une seule carte de la page démarre');
     await p.evaluate(()=>{window.testHidden=true;document.dispatchEvent(new Event('visibilitychange'));});
     await advance(2500);
     assert((await calls()).length===1 && await clicks()===0, 'Ni seconde carte ni navigation avant la première réponse complète');
     const firstEnd=await finish('price');await advance(1300);
     const firstCalls=await calls();
-    assert(firstCalls.length===2 && firstCalls[1].startedAt-firstEnd>=1000, 'Deuxième carte visible après le délai d’une seconde');
+    assert(firstCalls.length===2 && firstCalls[1].startedAt-firstEnd>=1000, 'Deuxième carte après le délai d’une seconde');
     await finish('price');await advance(3000);
-    assert((await calls()).length===2 && await clicks()===0, 'Option décochée : aucune navigation et carte hors écran ignorée');
-    await option().check();await advance(900);
+    assert((await calls()).length===3 && await clicks()===0, 'La carte sous le viewport est synchronisée sans navigation');
+    await option().check();await advance(2000);
+    assert(await clicks()===0, 'Suivant attend la réponse de la carte située en bas de page');
+    await finish('price');await advance(1900);
     assert(await clicks()===1 && (await calls()).filter(c=>c.kind==='page').length===1, 'Un seul clic natif malgré les deux boutons Suivant');
     await advance(4000);
-    assert(await clicks()===1 && (await calls()).filter(c=>c.kind==='price').length===2, 'Ancienne grille pendant une réponse lente : ni double clic ni prix supplémentaires');
+    assert(await clicks()===1 && (await calls()).filter(c=>c.kind==='price').length===3, 'Ancienne grille pendant une réponse lente : ni double clic ni prix supplémentaires');
     const pageEnd=await finish('page');await advance(1950);
     const page2Calls=await calls();
     assert(await p.evaluate(()=>window.currentPage)===2 && page2Calls.at(-1).kind==='price'
       && page2Calls.at(-1).startedAt-pageEnd>=1000, 'Page suivante affichée avant de reprendre les prix et délai conservé');
-    await finish('price');await advance(1300);await finish('price');await advance(1900);
-    assert(await clicks()===2, 'Passage automatique à la troisième page après ses deux cartes visibles');
-    await finish('page');await advance(1950);await finish('price');await advance(1300);await finish('price');await advance(5000);
+    await finish('price');await advance(1300);await finish('price');await advance(1300);await finish('price');await advance(1900);
+    assert(await clicks()===2, 'Passage automatique à la troisième page après ses trois cartes de la page');
+    await finish('page');await advance(1950);await finish('price');await advance(1300);await finish('price');await advance(1300);await finish('price');await advance(5000);
     const completed=await calls();
     assert(await clicks()===2 && await p.evaluate(()=>window.currentPage)===3, 'Arrêt à la dernière page');
-    assert(completed.filter(c=>c.kind==='price').length===6 && completed.filter(c=>c.kind==='price').every(c=>!c.url.includes('000000000013')&&!c.url.includes('000000000023')&&!c.url.includes('000000000033')), 'Six cartes visibles traitées, zéro carte hors écran');
-    assert(completed.slice(1).every(c=>c.hidden) && completed.length===8, 'Les cinq prix suivants et les deux changements de page continuent en arrière-plan');
+    assert(completed.filter(c=>c.kind==='price').length===9 && [13,23,33].every(n=>completed.some(c=>c.url.includes(String(n).padStart(12,'0')))), 'Neuf cartes traitées, y compris le bas de chacune des trois pages');
+    assert(completed.slice(1).every(c=>c.hidden) && completed.length===11, 'Les huit prix suivants et les deux changements de page continuent en arrière-plan');
     assert(completed.filter(c=>c.kind==='page').every(c=>c.url.includes('rarity=L&search=conserve')), 'Paramètres natifs et filtres conservés');
     assert((await p.locator('.wm-sync-detail').innerText()).includes('Dernière page'), 'Fin du parcours signalée dans le bandeau');
     await p.reload();await advance(1000);
@@ -115,6 +117,16 @@ async (page) => {
     await advance(5000);
     const stoppedClicks=await clicks();await advance(4000);
     assert(await clicks()===stoppedClicks, 'Décocher termine le chargement en vol sans passer encore à la page suivante');
+
+    await reset();
+    await p.evaluate(()=>{
+      window.cardsPerPage=50;window.renderPage(1);
+      for(let i=1;i<50;i++)localStorage.setItem('wm-market-v1:'+window.card(1,i).id,JSON.stringify({version:1,fetchedAt:Date.now(),summary:{}}));
+    });await advance(300);await toggle().check();await advance(2000);
+    assert((await calls()).length===1 && (await calls())[0].url.includes('000000000060') && await clicks()===0, 'Page de 50 cartes : les 49 prix en cache ne font pas sauter la dernière carte');
+    await finish('price');await advance(1900);
+    assert(await clicks()===1 && (await p.locator('.wm-sync-progress').innerText()).includes('50 / 50'), 'Suivant seulement après les 50 cartes de la page, sans défilement');
+    await toggle().uncheck();await finish('page');await advance(2000);
 
     await reset();
     await p.evaluate(()=>{const dialog=document.createElement('div');dialog.role='dialog';dialog.textContent='Carte ouverte';document.body.append(dialog);});
@@ -130,9 +142,10 @@ async (page) => {
     assert(await clicks()===1 && (await calls()).length===1, 'Interrupteur global respecté aussi en arrière-plan');
 
     await reset();
-    await p.evaluate(()=>{const h=document.querySelector('h3');delete h.__reactFiber$test;});await advance(300);
+    await p.evaluate(()=>{const h=[...document.querySelectorAll('h3')].at(-1);delete h.__reactFiber$test;});await advance(300);
     await toggle().check();await advance(2000);
-    assert(await clicks()===0, 'Carte visible non reconnue : la page ne doit pas être sautée');
+    assert(await clicks()===0, 'Carte sous le viewport non reconnue : la page ne doit pas être sautée');
+    assert((await p.locator('.wm-sync-progress').innerText()).includes('2 / 3') && (await p.locator('.wm-sync-status').innerText()).includes('identifiées'), 'Une carte inconnue compte dans le total et empêche le faux état À jour');
     await toggle().uncheck();
     await p.evaluate(()=>{document.querySelector('#grid').replaceChildren();});await advance(300);await toggle().check();await advance(2000);
     assert(await clicks()===0, 'Une grille vide ne provoque pas de boucle de navigation');

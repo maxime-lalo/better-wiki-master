@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters — Prix de la collection
 // @namespace    local.wikimasters.collection
-// @version      1.5.1
+// @version      1.6.0
 // @description  Prix en cache, filtres des notifications et mise aux enchères sans quitter la collection.
 // @author       maxime-lalo
 // @license      MIT
@@ -62,6 +62,7 @@
   const MIN_INTERVAL_MS = 1000;
   const MAX_INTERVAL_MS = 30000;
   const REQUEST_TIMEOUT_MS = 20000;
+  const SHARED_DEFAULT_URL = 'https://wikimasters-cache.eplp.fr';
   const PREFIX = 'wm-market-v1:';
   const GATE_KEY = PREFIX + 'gate';
   const BLOCK_KEY = PREFIX + 'automation-block';
@@ -87,6 +88,8 @@
   let pageCandidate = null;
   let activePage = null;
   let pageError = '';
+  const shared = { signature: '', busy: false, checked: new Map(), waiting: new Map(),
+    pending: new Map(), retryAt: 0, message: 'Cache partagé désactivé.', uploaded: {}, formSignature: '', lookupUrl: '', deniedKey: '' };
   const notificationPanels = new Map();
   const savedNotificationType = read(NOTIFICATION_FILTER_KEY);
   let notificationType = typeof savedNotificationType === 'string' ? savedNotificationType : '';
@@ -113,12 +116,13 @@
         && Number.isInteger(s.count) && s.count >= 0
         && (s.latest === undefined || (Number.isFinite(s.latest) && s.latest >= 0)));
   }
-  function save(id, data, fetchedAt = Date.now()) {
+  function save(id, data, fetchedAt = Date.now(), source = 'site', quiet = false) {
     if (!UUID.test(id) || !validSummary(data?.summary)) return false;
     if ((cached(id)?.fetchedAt || 0) > fetchedAt) return true;
-    const ok = write(PREFIX + id, { version: 1, fetchedAt, summary: data.summary });
+    const ok = write(PREFIX + id, { version: 1, fetchedAt, summary: data.summary, source });
     if (ok) failures.delete(id);
-    renderAll();
+    if (ok && source === 'site') queueContribution(id, { fetchedAt, summary: data.summary });
+    if (!quiet) renderAll();
     return ok;
   }
   function automationBlocked() { return read(BLOCK_KEY)?.code === 'automation_limit'; }
@@ -128,6 +132,9 @@
       ? Math.round(saved.intervalMs / 500) * 500 : DEFAULT_INTERVAL_MS;
     return { enabled: typeof saved?.enabled === 'boolean' ? saved.enabled : true,
       autoNext: saved?.autoNext === true,
+      sharedEnabled: saved?.sharedEnabled === true,
+      sharedUrl: typeof saved?.sharedUrl === 'string' ? saved.sharedUrl : SHARED_DEFAULT_URL,
+      contributorKey: typeof saved?.contributorKey === 'string' ? saved.contributorKey : '',
       intervalMs: Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS, intervalMs)) };
   }
   function setSyncSettings(update) {
@@ -152,6 +159,199 @@
     // Recalculer depuis la fin de la requête précédente permet de modifier le
     // curseur pendant le compte à rebours, sans remettre le compteur à zéro.
     return g.waitFrom ? g.waitFrom + settings.intervalMs : g.next;
+  }
+
+  function sharedConfig() {
+    const settings = syncSettings();
+    return { enabled: settings.sharedEnabled, url: settings.sharedUrl, key: settings.contributorKey };
+  }
+  function sharedUrl(input) {
+    const url = new URL(input);
+    if (url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error('Utiliser une adresse de serveur sans chemin ni identifiants.');
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) {
+      throw new Error('Le cache partagé doit utiliser HTTPS.');
+    }
+    return url.origin;
+  }
+  function currentShared(config) {
+    return syncSettings().enabled && JSON.stringify(config) === JSON.stringify(sharedConfig());
+  }
+  function uploadedKey(config) { return PREFIX + 'shared-uploaded:' + config.url; }
+  function queueContribution(id, value) {
+    const config = sharedConfig();
+    if (!config.enabled || !config.key || value.source === 'shared') return;
+    if ((shared.uploaded[id] || 0) < value.fetchedAt) shared.pending.set(id, { id, fetchedAt: value.fetchedAt, summary: value.summary });
+  }
+  function markUploaded(config, entries) {
+    const markers = read(uploadedKey(config)) || {};
+    for (const value of entries) {
+      markers[value.id] = Math.max(Number(markers[value.id]) || 0, value.fetchedAt);
+      if (shared.pending.get(value.id)?.fetchedAt <= value.fetchedAt) shared.pending.delete(value.id);
+    }
+    shared.uploaded = markers;
+    write(uploadedKey(config), markers);
+  }
+  function sharedFailure(error, config) {
+    if (!currentShared(config)) return;
+    if (error.status === 401 && config.key) {
+      shared.deniedKey = config.key;
+      shared.message = 'Contributions refusées. Le cache reste disponible en lecture seule.';
+      return;
+    }
+    shared.retryAt = Date.now() + Math.max(60000, error.retryMs || 0);
+    shared.message = `Cache partagé indisponible : ${error.message}. Mode local avec délai WikiMasters.`;
+  }
+  async function sharedRequest(config, path, body, contribute = false) {
+    if (!currentShared(config)) throw new Error('Réglages modifiés');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await nativeFetch(sharedUrl(config.url) + path, {
+        method: 'POST', credentials: 'omit', referrerPolicy: 'no-referrer', mode: 'cors', signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...body, ...(contribute ? { contributorKey: config.key } : {}) }),
+      });
+      if (!response.ok) {
+        const error = new Error(response.status === 401 ? 'clé de contribution refusée' : `HTTP ${response.status}`);
+        error.status = response.status;
+        const retry = response.headers.get('Retry-After');
+        const seconds = retry === null ? NaN : Number(retry);
+        error.retryMs = Number.isFinite(seconds) ? seconds * 1000 : Math.max(0, Date.parse(retry) - Date.now()) || 0;
+        throw error;
+      }
+      const result = await response.json();
+      if (!currentShared(config)) throw new Error('Réglages modifiés');
+      return result;
+    } finally { clearTimeout(timer); }
+  }
+  function importShared(entries, allowed) {
+    if (!Array.isArray(entries) || entries.length > 100) throw new Error('Réponse de cache invalide');
+    for (const value of entries) {
+      if (!value || !UUID.test(value.id) || !allowed.has(value.id) || !validSummary(value.summary)
+          || !Number.isSafeInteger(value.fetchedAt) || value.fetchedAt < 946684800000 || value.fetchedAt > Date.now() + 120000) {
+        throw new Error('Prix partagé invalide');
+      }
+    }
+    for (const value of entries) save(value.id, value, value.fetchedAt, 'shared', true);
+    renderAll();
+  }
+  async function sharedLookup(config, ids) {
+    const result = await sharedRequest(config, '/v1/lookup', { ids });
+    const wanted = new Set(ids);
+    if (!Array.isArray(result?.entries) || !Array.isArray(result.missing)
+        || result.missing.some(id => !wanted.has(id))
+        || new Set([...result.entries.map(v => v?.id), ...result.missing]).size !== wanted.size) throw new Error('Réponse de cache incomplète');
+    importShared(result.entries, wanted);
+    return result;
+  }
+  async function sharedPass() {
+    const config = sharedConfig();
+    if (!config.enabled) { shared.message = 'Cache partagé désactivé.'; return true; }
+    if (shared.busy) return false;
+    const signature = JSON.stringify(config);
+    if (shared.signature !== signature) {
+      shared.signature = signature;
+      if (shared.lookupUrl !== config.url) { shared.checked.clear(); shared.waiting.clear(); shared.lookupUrl = config.url; }
+      shared.pending.clear(); shared.retryAt = 0;
+      shared.uploaded = read(uploadedKey(config)) || {};
+      if (config.key) {
+        // Importer le cache existant en lots ; les prix venus du serveur ne sont
+        // jamais renvoyés comme de nouvelles observations WikiMasters.
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (!key?.startsWith(PREFIX) || !UUID.test(key.slice(PREFIX.length))) continue;
+          const id = key.slice(PREFIX.length), value = cached(id);
+          if (value) queueContribution(id, value);
+        }
+      }
+      shared.message = config.key ? 'Cache partagé connecté.' : 'Activation du partage automatique…';
+    }
+    if (shared.retryAt > Date.now()) return true;
+    // Lecture groupée AVANT le délai WikiMasters. Tous les prix disponibles
+    // s'affichent ensemble, sans délai artificiel entre les cartes du lot.
+    const ids = [...new Set([...views.values()].filter(onCollectionPage).map(v => v.id))]
+      .filter(id => (shared.waiting.get(id) || 0) <= Date.now()
+        && shared.checked.get(id) !== (manual.get(id) || 0)).slice(0, 100);
+    const canContribute = config.key && shared.deniedKey !== config.key;
+    const registrationGate = PREFIX + 'registration:' + config.url;
+    const needsKey = !config.key && (read(registrationGate)?.until || 0) <= Date.now();
+    const entries = [...shared.pending.values()].slice(0, 100);
+    if (!ids.length && !(canContribute && entries.length) && !needsKey) return true;
+    shared.busy = true;
+    try {
+      if (ids.length) {
+        shared.message = `Recherche de ${ids.length} cartes dans le cache partagé…`;
+        renderControls();
+        const requested = new Map(ids.map(id => [id, manual.get(id) || 0]));
+        const result = await sharedLookup(config, ids);
+        for (const id of ids) shared.checked.set(id, requested.get(id));
+        shared.message = `Cache partagé : ${result.entries.length} prix trouvés, ${result.missing.length} absents du lot.`;
+      } else if (needsKey) {
+        shared.message = 'Activation du partage automatique…';
+        renderControls();
+        try {
+          if (!navigator.locks) throw new Error('Coordination entre onglets indisponible');
+          await navigator.locks.request(PREFIX + 'registration:' + config.url, { ifAvailable: true }, async lock => {
+            if (!lock || !currentShared(config) || sharedConfig().key) return;
+            if ((read(registrationGate)?.until || 0) > Date.now()) return;
+            const result = await sharedRequest(config, '/v1/installations', {});
+            if (!/^bwm_[A-Za-z0-9_-]{43}$/.test(result?.contributorKey)) throw new Error('Clé automatique invalide');
+            setSyncSettings({ contributorKey: result.contributorKey });
+            shared.message = 'Partage automatique activé.';
+          });
+        } catch (error) {
+          if (currentShared(config)) {
+            write(registrationGate, { until: Date.now() + Math.max(60000, error.retryMs || 0) });
+            shared.message = 'Lecture du cache disponible. Activation du partage différée : ' + error.message + '.';
+          }
+        }
+      } else {
+        shared.message = `Partage de ${entries.length} prix en cache…`;
+        renderControls();
+        const result = await sharedRequest(config, '/v1/contributions', { entries }, true);
+        if (result?.accepted !== entries.length) throw new Error('Contribution non confirmée');
+        markUploaded(config, entries);
+        shared.message = `Cache partagé : ${entries.length} prix envoyés${shared.pending.size ? `, ${shared.pending.size} en attente` : ''}.`;
+      }
+    } catch (error) { sharedFailure(error, config); }
+    finally { shared.busy = false; renderControls(); }
+    return false;
+  }
+  async function sharedBeforeSite(job) {
+    const config = sharedConfig();
+    if (!config.enabled || shared.retryAt > Date.now()) return { proceed: true };
+    try {
+      if (!config.key || shared.deniedKey === config.key) {
+        await sharedLookup(config, [job.id]);
+        return { proceed: job.requested ? (cached(job.id)?.fetchedAt || 0) <= job.requested : !cached(job.id) };
+      }
+      const claim = await sharedRequest(config, '/v1/claims', { id: job.id, after: job.requested }, true);
+      if (claim?.state === 'cached') { importShared([claim.entry], new Set([job.id])); return { proceed: false }; }
+      if (claim?.state === 'busy') {
+        shared.waiting.set(job.id, Date.now() + 5000);
+        shared.checked.delete(job.id);
+        shared.message = 'Un autre utilisateur récupère ce prix. Vérification dans 5 s.';
+        return { proceed: false };
+      }
+      if (claim?.state !== 'granted' || typeof claim.token !== 'string' || !Number.isFinite(claim.expiresAt)) throw new Error('Réservation invalide');
+      return { proceed: true, lease: { config, id: job.id, token: claim.token } };
+    } catch (error) { sharedFailure(error, config); return { proceed: true }; }
+  }
+  async function finishSharedLease(lease, success) {
+    if (!lease || !currentShared(lease.config)) return;
+    try {
+      if (success) {
+        const value = cached(lease.id);
+        if (!value) return;
+        const entries = [{ id: lease.id, fetchedAt: value.fetchedAt, summary: value.summary }];
+        const result = await sharedRequest(lease.config, '/v1/contributions', { entries }, true);
+        if (result?.accepted !== 1) throw new Error('Contribution non confirmée');
+        markUploaded(lease.config, entries);
+      }
+      // Publier le prix avant de libérer la réservation évite une seconde
+      // consultation pendant l'envoi. En cas d'échec, le bail expirera seul.
+      await sharedRequest(lease.config, '/v1/claims/release', { id: lease.id, token: lease.token }, true);
+    } catch (error) { sharedFailure(error, lease.config); }
   }
   async function pause(response) {
     if (response.status === 403) {
@@ -428,12 +628,12 @@
     return ids?.size === 1 ? { id: [...ids][0], rarity, title: heading.textContent.trim() } : null;
   }
 
-  function visible(view) {
-    // La zone affichée de la collection reste la référence même si l'onglet
-    // est en arrière-plan. Ne pas étendre le chargement aux cartes hors écran.
+  function onCollectionPage(view) {
+    // Toute la grille de la page courante est éligible, y compris sous la
+    // ligne de flottaison. Les cartes des autres pages ne sont pas parcourues.
     if (!view.node.isConnected || location.pathname !== '/collection') return false;
     const r = view.cardNode.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+    return r.width > 0 && r.height > 0;
   }
   function render(view) {
     const entry = cached(view.id);
@@ -447,7 +647,7 @@
     const blocked = automationBlocked();
     const state = blocked ? 'Appels refusés par le site' : !storageOK ? 'Stockage indisponible' : !navigator.locks ? 'Web Locks indisponible'
       : pending ? 'Chargement…' : !settings.enabled ? 'Synchronisation désactivée' : paused ? 'Pause API' : error ? 'Échec · réessayer ↻'
-      : entry ? new Date(entry.fetchedAt).toLocaleDateString('fr-FR') : 'Non chargé';
+      : entry ? `${entry.source === 'shared' ? 'Partagé · ' : ''}${new Date(entry.fetchedAt).toLocaleDateString('fr-FR')}` : 'Non chargé';
     const signature = JSON.stringify([entry, state, pending, paused, blocked, settings.enabled]);
     if (view.signature === signature) return;
     view.signature = signature;
@@ -461,7 +661,8 @@
       : 'Actualiser moyenne, dernière vente et nombre de ventes';
     view.node.title = [
       `Marché · ${view.rarity} · prix en WikiBidous`,
-      entry ? `Consulté le ${new Date(entry.fetchedAt).toLocaleString('fr-FR')}. Cache sans expiration.` : 'Chargement des cartes visibles, une à la fois.',
+      entry ? `Consulté le ${new Date(entry.fetchedAt).toLocaleString('fr-FR')}. Cache sans expiration.` : 'Chargement des cartes de cette page, une à la fois.',
+      entry?.source === 'shared' ? 'Source : cache partagé communautaire, chiffres non certifiés par WikiMasters.' : '',
       entry && !stats ? 'Aucune vente enregistrée pour cette rareté.' : '',
       error || '',
     ].filter(Boolean).join('\n');
@@ -508,6 +709,16 @@
           <input id="wm-sync-delay" type="range" min="1" max="30" step="0.5" aria-label="Délai après chaque réponse (secondes)">
         </label>
         <label class="wm-sync-auto-next"><input type="checkbox"><span>Passer automatiquement à la page suivante</span></label>
+        <details class="wm-shared"><summary>Cache partagé</summary>
+          <label class="wm-sync-auto-next"><input class="wm-shared-enabled" type="checkbox"><span>Utiliser le cache partagé</span></label>
+          <p class="wm-shared-info">Activation sans compte : les prix déjà en cache et les nouvelles consultations sont partagés automatiquement. Aucun cookie ni identifiant de compte WikiMasters envoyé.</p>
+          <details class="wm-shared-advanced"><summary>Paramètres avancés</summary>
+          <form class="wm-shared-form">
+            <label>Serveur HTTPS<input class="wm-shared-url" type="url" aria-label="Adresse du cache partagé" required></label>
+            <label>Clé de contribution (gérée automatiquement)<input class="wm-shared-key" type="password" aria-label="Clé de contribution" autocomplete="off"></label>
+            <button type="submit">Enregistrer le cache partagé</button>
+          </form></details>
+        </details><span class="wm-shared-status" role="status"></span>
         <button class="wm-sync-resume" type="button">Reprendre le chargement</button>
       </div>`;
       controls.querySelector('[role="switch"]').addEventListener('change', event => {
@@ -518,6 +729,25 @@
       });
       controls.querySelector('.wm-sync-auto-next input').addEventListener('change', event => {
         setSyncSettings({ autoNext: event.target.checked });
+      });
+      shared.formSignature = '';
+      controls.querySelector('.wm-shared-enabled').addEventListener('change', event => {
+        setSyncSettings({ sharedEnabled: event.target.checked });
+      });
+      controls.querySelector('.wm-shared-url').addEventListener('input', event => {
+        event.target.setCustomValidity('');
+      });
+      controls.querySelector('.wm-shared-form').addEventListener('submit', event => {
+        event.preventDefault();
+        const input = controls.querySelector('.wm-shared-url');
+        input.setCustomValidity('');
+        try {
+          const url = sharedUrl(input.value.trim());
+          const settings = syncSettings();
+          let key = controls.querySelector('.wm-shared-key').value.trim();
+          if (url !== settings.sharedUrl && key === settings.contributorKey) key = '';
+          setSyncSettings({ sharedUrl: url, contributorKey: key });
+        } catch (error) { input.setCustomValidity(error.message); input.reportValidity(); }
       });
       controls.querySelector('.wm-sync-resume').addEventListener('click', () => { void resumeLoading(); });
       const heading = main.querySelector('h1');
@@ -533,7 +763,13 @@
     const request = g.request?.expiresAt > now ? g.request : null;
     const job = choose();
     const currentViews = [...views.values()].filter(v => v.node.isConnected);
-    const visibleViews = currentViews.filter(visible);
+    const pageViews = currentViews.filter(onCollectionPage);
+    const pageNodes = pageCardNodes();
+    const recognizedViews = pageNodes.flatMap(node => {
+      const view = views.get(node), info = cardInfo(node.querySelector('h3'), node);
+      return view && info?.id === view.id ? [view] : [];
+    });
+    const unknownCards = recognizedViews.length !== pageNodes.length;
     const errors = !!pageError || currentViews.some(v => failures.has(v.id));
     let message;
     let detail = 'Les prix en cache sont conservés.';
@@ -557,6 +793,7 @@
       message = 'Passage automatique arrêté.';
       detail = pageError + ' Utiliser « Reprendre le chargement » pour réessayer.';
     } else if (collectionLoads.size) message = 'En attente du chargement de la collection.';
+    else if (settings.sharedEnabled && shared.busy) message = 'Synchronisation du cache partagé…';
     else if (job) {
       const remaining = Math.max(0, nextRequestAt(g, settings) - now);
       message = remaining ? 'En attente du prochain chargement.' : 'Synchronisation prête.';
@@ -564,15 +801,16 @@
       detail = remaining ? `Prochaine carte : ${title} · dans ${format(Math.ceil(remaining / 100) / 10)} s.`
         : `Prochaine carte : ${title}.`;
     } else if (errors) message = 'Chargement arrêté — certains prix sont en erreur.';
-    else if (!visibleViews.length) message = 'En attente de cartes visibles à synchroniser.';
-    else if (visibleViews.every(v => cached(v.id))) {
-      message = 'À jour — toutes les cartes visibles sont en cache.';
+    else if (unknownCards) message = 'Certaines cartes de cette page n’ont pas pu être identifiées.';
+    else if (!pageViews.length) message = 'En attente de cartes à synchroniser sur cette page.';
+    else if (pageViews.every(v => cached(v.id))) {
+      message = 'À jour — toutes les cartes de cette page sont en cache.';
       if (settings.autoNext) {
         const pagination = collectionPagination();
         if (pagination && !pagination.loading && pagination.page < pagination.total) {
           const remaining = Math.max(0, nextRequestAt(g, settings) - now);
           detail = `Passage automatique à la page ${pagination.page + 1} / ${pagination.total}${remaining ? ` dans ${format(Math.ceil(remaining / 100) / 10)} s` : ' en attente'}.`;
-        } else if (pagination && !pagination.loading) detail = 'Dernière page atteinte. Les cartes hors écran ne sont pas chargées.';
+        } else if (pagination && !pagination.loading) detail = 'Dernière page atteinte. Toutes ses cartes sont en cache.';
       }
     } else message = 'Chargement manuel — utiliser ↻ sur une carte.';
     const setText = (selector, text) => {
@@ -581,10 +819,18 @@
     };
     setText('.wm-sync-status', message);
     setText('.wm-sync-detail', detail);
-    const count = currentViews.filter(v => cached(v.id)).length;
-    setText('.wm-sync-progress', `${count} / ${currentViews.length} cartes de cette page en cache`);
+    const count = recognizedViews.filter(view => cached(view.id)).length;
+    setText('.wm-sync-progress', `${count} / ${pageNodes.length} cartes de cette page en cache`);
     controls.querySelector('[role="switch"]').checked = settings.enabled;
     controls.querySelector('.wm-sync-auto-next input').checked = settings.autoNext;
+    controls.querySelector('.wm-shared-enabled').checked = settings.sharedEnabled;
+    const formSignature = JSON.stringify([settings.sharedUrl, settings.contributorKey]);
+    if (shared.formSignature !== formSignature) {
+      shared.formSignature = formSignature;
+      controls.querySelector('.wm-shared-url').value = settings.sharedUrl;
+      controls.querySelector('.wm-shared-key').value = settings.contributorKey;
+    }
+    setText('.wm-shared-status', settings.sharedEnabled ? shared.message : 'Cache partagé désactivé.');
     const slider = controls.querySelector('input[type="range"]');
     slider.value = String(settings.intervalMs / 1000);
     slider.setAttribute('aria-valuetext', `${format(settings.intervalMs / 1000)} secondes après chaque réponse`);
@@ -647,14 +893,16 @@
   }
   function choose() {
     if (!syncSettings().enabled) return null;
-    const candidates = [...views.values()].filter(visible);
+    const candidates = [...views.values()].filter(onCollectionPage);
+    const waiting = id => syncSettings().sharedEnabled && (shared.waiting.get(id) || 0) > Date.now();
     for (const [id, requested] of manual) {
       if (!candidates.some(v => v.id === id)) { manual.delete(id); continue; }
       if ((cached(id)?.fetchedAt || 0) > requested) { manual.delete(id); continue; }
+      if (waiting(id)) continue;
       return { id, requested };
     }
     if (!AUTO_LOAD) return null;
-    const view = candidates.find(v => !cached(v.id) && !failures.has(v.id));
+    const view = candidates.find(v => !cached(v.id) && !failures.has(v.id) && !waiting(v.id));
     return view ? { id: view.id, requested: 0 } : null;
   }
 
@@ -670,9 +918,9 @@
     }
     return null;
   }
-  function visibleCardNodes() {
+  function pageCardNodes() {
     return [...document.querySelectorAll('main h3')].map(heading => heading.closest('div.cursor-pointer'))
-      .filter(node => node?.parentElement?.classList.contains('group') && visible({ node, cardNode: node }));
+      .filter(node => node?.parentElement?.classList.contains('group') && onCollectionPage({ node, cardNode: node }));
   }
   function nextPageReady() {
     const pagination = collectionPagination();
@@ -683,9 +931,9 @@
       pageCandidate = null;
       return null;
     }
-    const nodes = visibleCardNodes();
-    // Une carte visible non reconnue ou en erreur doit empêcher de sauter la page.
-    // Les cartes hors du viewport ne font pas partie de cette vérification.
+    const nodes = pageCardNodes();
+    // Toute carte de cette page non reconnue, manquante ou en erreur bloque
+    // Suivant, même si elle est située plus bas que la zone affichée.
     if (!nodes.length || nodes.some(node => {
       const view = views.get(node);
       const info = cardInfo(node.querySelector('h3'), node);
@@ -746,7 +994,9 @@
 
   async function pump() {
     const settings = syncSettings();
-    if (!settings.enabled || (settings.autoNext && pageError) || automationBlocked() || busy || collectionLoads.size || !storageOK || !navigator.locks || location.pathname !== '/collection') return;
+    if (!settings.enabled || busy || collectionLoads.size || !storageOK || !navigator.locks || location.pathname !== '/collection') return;
+    if (!await sharedPass()) return;
+    if (busy || !syncSettings().enabled || (syncSettings().autoNext && pageError) || automationBlocked()) return;
     const g = gate();
     if (Date.now() < Math.max(nextRequestAt(g), g.until, g.retryAfterUntil) || (!choose() && !nextPageReady())) return;
     busy = true;
@@ -755,12 +1005,21 @@
       await navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
         const settings = syncSettings();
         if (!lock || !settings.enabled || (settings.autoNext && pageError) || automationBlocked() || collectionLoads.size || !storageOK || location.pathname !== '/collection') return;
-        const current = gate();
+        let current = gate();
         if (Date.now() < Math.max(nextRequestAt(current), current.until, current.retryAfterUntil)) return;
         const job = choose(); // Relire le cache APRES avoir obtenu le verrou.
         if (!job) {
           const pagination = nextPageReady();
           if (pagination) await advanceCollectionPage(pagination);
+          return;
+        }
+        const sharedResult = await sharedBeforeSite(job);
+        if (!sharedResult.proceed) { renderAll(); return; }
+        current = gate();
+        if (!syncSettings().enabled || automationBlocked() || location.pathname !== '/collection'
+            || Date.now() < Math.max(nextRequestAt(current), current.until, current.retryAfterUntil)
+            || choose()?.id !== job.id) {
+          await finishSharedLease(sharedResult.lease, false);
           return;
         }
         const started = Date.now();
@@ -773,6 +1032,7 @@
         renderAll();
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        let success = false;
         try {
           const response = await nativeFetch(`/api/marketplace/cards/${job.id}/sales?scope=summary`, {
             credentials: 'same-origin', signal: controller.signal,
@@ -782,6 +1042,7 @@
             throw new Error(`HTTP ${response.status}. Appels temporairement suspendus.`);
           }
           if (!save(job.id, await response.json())) throw new Error('Réponse invalide ou cache indisponible.');
+          success = true;
         } catch (error) {
           failures.set(job.id, error.message || 'Erreur réseau.');
           // Aucun réessai automatique sur cette carte. Les anciennes valeurs restent visibles.
@@ -799,6 +1060,7 @@
           activeId = null;
           renderAll();
         }
+        await finishSharedLease(sharedResult.lease, success);
       });
     } catch (error) { console.warn('[WikiMasters prix]', error); }
     finally { busy = false; renderControls(); }
@@ -826,6 +1088,10 @@
       .wm-sync-toggle input:after{content:'';position:absolute;left:3px;top:3px;width:12px;height:12px;border-radius:50%;background:#d8e6df}
       .wm-sync-toggle input:checked{background:#1c7858;border-color:#39e2a8}.wm-sync-toggle input:checked:after{left:17px;background:#fff}
       .wm-sync-auto-next{display:flex;align-items:flex-start;gap:8px;cursor:pointer}.wm-sync-auto-next input{flex:none;margin:3px 0 0;accent-color:#39e2a8}.wm-sync-auto-next span{min-width:0}
+      .wm-shared{border-top:1px solid #ffffff20;padding-top:8px}.wm-shared summary{cursor:pointer;color:#a4eccf}.wm-shared[open] summary{margin-bottom:8px}
+      .wm-shared-form{display:flex;flex-direction:column;gap:8px;margin-top:8px}.wm-shared-form label{display:flex;flex-direction:column;gap:4px}
+      .wm-shared-form input{box-sizing:border-box;min-width:0;width:100%;padding:6px;border:1px solid #ffffff30;border-radius:6px;background:#19251e;color:inherit;font:inherit}
+      .wm-shared-info{margin:8px 0;font-size:11px;color:#91a89b}.wm-shared-advanced{font-size:11px}.wm-shared-form p{margin:0;font-size:10px;color:#91a89b}.wm-shared-status{font-size:10px;color:#91a89b;overflow-wrap:anywhere}
       .wm-sync-delay{display:flex;flex-direction:column;gap:6px}.wm-sync-delay>span{display:flex;justify-content:space-between;gap:12px}.wm-sync-delay output{font-weight:700;color:#a4eccf;white-space:nowrap}
       .wm-sync-delay input{width:100%;min-width:0;margin:0;accent-color:#39e2a8;cursor:pointer}
       .wm-market-controls input:focus-visible{outline:2px solid #39e2a8;outline-offset:3px}

@@ -22,9 +22,10 @@ Les améliorations s'appliquent au site ouvert dans ce navigateur. Elles ne s'in
 
 - **Prix sur les cartes** : prix moyen, dernière vente et nombre de ventes, selon la rareté effective et les données du formulaire de mise aux enchères.
 - **Cache sans expiration** : les données déjà récupérées sont réutilisées. Le bouton **↻** actualise une carte ; sa date de consultation reste visible.
+- **Cache partagé facultatif** : recherche de toutes les cartes de la page courante en une requête groupée, avant de charger les prix manquants depuis WikiMasters. L'activation crée automatiquement une clé par installation et partage les prix locaux et les nouvelles réponses.
 - **Bandeau permanent** : reste visible sur la collection et pendant le défilement, avec l'état, le nom de la carte en cours, la prochaine carte, le compte à rebours et le nombre de cartes de la page en cache.
-- **Chargement progressif** : prix manquants des cartes visibles à l'écran, une seule requête à la fois entre tous les onglets. Le délai réglable commence **après réception et traitement complets de la réponse précédente**, pas au départ de la requête.
-- **Pages suivantes en option** : la case **Passer automatiquement à la page suivante** active le clic sur le bouton natif **Suivant** après traitement des cartes visibles. Les filtres sont conservés et le parcours s'arrête à la dernière page.
+- **Chargement progressif** : prix manquants des cartes de la page courante, y compris en bas de page, une seule requête à la fois entre tous les onglets. Le délai réglable commence **après réception et traitement complets de la réponse précédente**, pas au départ de la requête.
+- **Pages suivantes en option** : la case **Passer automatiquement à la page suivante** active le clic sur le bouton natif **Suivant** après traitement des cartes de la page courante. Les filtres sont conservés et le parcours s'arrête à la dernière page.
 - **Pauses API** : arrêt sur les erreurs prévues, prise en compte de `Retry-After` et bouton de reprise manuelle. Le cache reste consultable pendant l'arrêt.
 - **Notifications filtrables** : choix d'un type, compteurs et mémorisation du filtre. Le filtre porte sur les notifications déjà chargées, sans requête supplémentaire.
 - **Mise aux enchères sur place** : après succès, fermeture du formulaire et du détail, retrait du seul exemplaire concerné, conservation des filtres et de la page, sans rechargement global de la collection.
@@ -79,7 +80,7 @@ Pour une ancienne installation collée manuellement, remplacer son contenu une p
 
 ## Cache, appels et dépannage
 
-Le cache est local au navigateur et à l'appareil. Effacer les données du site le supprime. Les statistiques ne sont pas des prix en temps réel : consulter la date et utiliser **↻** si une actualisation est autorisée et nécessaire.
+Le cache local reste propre au navigateur et à l'appareil. Effacer les données du site le supprime ; cela ne supprime pas les contributions déjà envoyées au cache partagé facultatif. Les statistiques ne sont pas des prix en temps réel : consulter la date et utiliser **↻** si une actualisation est autorisée et nécessaire.
 
 | Symptôme | À vérifier |
 | --- | --- |
@@ -96,21 +97,37 @@ Le bandeau de collection propose un interrupteur **Synchronisation des prix** et
 
 Exemple : avec un délai de 3 secondes et une réponse de la carte A qui prend 2 secondes, la carte B pourra partir au plus tôt 5 secondes après le départ de A. Le corps JSON doit être entièrement reçu avant que l'attente commence. Si le délai change pendant l'attente, le temps déjà écoulé depuis la dernière réponse est conservé.
 
-Désactiver la synchronisation empêche les prochains appels du script, y compris les actualisations ↻. Une requête déjà en cours termine et alimente le cache ; les consultations natives du site continuent normalement. Réactiver reprend les prix manquants visibles en respectant le délai restant et les pauses serveur. Cela ne lève pas un arrêt `automation_limit` : le bouton de reprise existant reste distinct.
+Désactiver la synchronisation empêche les prochains appels du script, y compris les actualisations ↻. Une requête déjà en cours termine et alimente le cache ; les consultations natives du site continuent normalement. Réactiver reprend les prix manquants de la page en respectant le délai restant et les pauses serveur. Cela ne lève pas un arrêt `automation_limit` : le bouton de reprise existant reste distinct.
 
-La case **Passer automatiquement à la page suivante** est décochée par défaut. Une fois activée, le script traite **uniquement les cartes visibles dans la fenêtre**, une par une, puis clique sur **Suivant** quand leurs prix sont en cache. Il attend la réponse et l'affichage de la nouvelle page avant de recommencer. Il part de la page actuelle, conserve les filtres et s'arrête à la dernière page ; il ne revient pas au début. Il ne fait pas défiler la grille pour chercher les cartes hors écran : **celles-ci restent volontairement non chargées**. Le défilement habituel déclenché par le bouton natif reste celui du site.
+La case **Passer automatiquement à la page suivante** est décochée par défaut. Une fois activée, le script traite **toutes les cartes de la page courante (jusqu’à 50), y compris celles sous la zone affichée**, une par une, puis clique sur **Suivant** quand leurs prix sont en cache. Il attend la réponse et l'affichage de la nouvelle page avant de recommencer. Il part de la page actuelle, conserve les filtres et s'arrête à la dernière page ; il ne revient pas au début. Aucun défilement manuel n’est nécessaire : **les 50 cartes doivent être en cache avant le passage à la suivante**. Une carte non reconnue ou en erreur bloque ce passage. Le défilement habituel déclenché par le bouton natif reste celui du site.
 
 Le délai choisi s'applique aussi avant le clic sur **Suivant** et après le chargement de la page, même lorsque ses prix sont déjà en cache. Une fenêtre de carte ouverte suspend le passage automatique. Décocher l'option arrête les prochains changements de page ; l'interrupteur général arrête aussi les prochains chargements de prix. Une navigation en cours peut se terminer. Un échec de navigation arrête le parcours et affiche le bouton **Reprendre le chargement**, toujours soumis aux pauses serveur.
 
-**Le traitement continue quand l'onglet Collection reste ouvert en arrière-plan**, y compris les clics sur **Suivant** si l'option est cochée. La sélection reste limitée aux cartes dans la zone affichée de cet onglet, sans charger celles hors écran. Le cache, le délai minimal après chaque réponse, le verrou entre onglets et les pauses serveur restent actifs. Fermer l'onglet ou naviguer vers une autre page dans cet onglet arrête le traitement : garder la collection ouverte et utiliser un autre onglet pour naviguer ailleurs.
+**Le traitement continue quand l'onglet Collection reste ouvert en arrière-plan**, y compris les clics sur **Suivant** si l'option est cochée. La sélection comprend toute la grille de la page courante, même les cartes plus bas dans la page. Le cache, le délai minimal après chaque réponse, le verrou entre onglets et les pauses serveur restent actifs. Fermer l'onglet ou naviguer vers une autre page dans cet onglet arrête le traitement : garder la collection ouverte et utiliser un autre onglet pour naviguer ailleurs.
 
 Le script ne peut pas garantir une cadence exacte en arrière-plan : les navigateurs peuvent retarder les timers, voire suspendre l'onglet. Le délai choisi est un **minimum**, sans rattrapage par rafale au retour. Voir la [documentation Chrome sur les timers d'arrière-plan](https://developer.chrome.com/blog/timer-throttling-in-chrome-88) et les [politiques de visibilité des navigateurs](https://developer.mozilla.org/en-US/docs/Web/API/Page_Visibility_API#policies_in_place_to_aid_background_page_performance).
 
 L'interrupteur, le délai et la case de pagination sont conservés entre visites et partagés entre les onglets du même navigateur. Le bandeau indique aussi la carte ou la page chargée dans un autre onglet. Après mise à jour, recharger les anciens onglets pour qu'ils utilisent tous cette coordination. Les états **À jour**, **Désactivée**, **En cours**, **En attente** et **En pause** restent affichés même quand aucun appel n'est lancé.
 
+### Utiliser le cache partagé
+
+Dans le bandeau, ouvrir **Cache partagé** puis cocher **Utiliser le cache partagé**. Le serveur par défaut est `https://wikimasters-cache.eplp.fr`. L'option est désactivée par défaut ; les prix locaux existants sont conservés. Aucun compte ni clé à copier : l'activation suffit. Une autre adresse HTTPS peut être configurée dans **Paramètres avancés**.
+
+Le script commence par envoyer les identifiants des cartes de la page courante en un seul lot au backend. Les prix disponibles s'affichent ensemble, sans le délai WikiMasters. Il consulte ensuite le jeu uniquement pour les cartes absentes, avec le délai, les pauses serveur et la coordination entre onglets habituels. Chaque page commence par cette lecture groupée ; le navigateur ne télécharge pas tout le catalogue mondial.
+
+La lecture est publique. À la première activation, une **clé propre à l'installation est créée automatiquement**, sans compte, puis conservée dans le navigateur et partagée entre ses onglets. L'activation autorise l'import des prix déjà enregistrés dans le navigateur, par lots de 100 maximum, puis l'envoi des nouvelles réponses. Un rechargement réutilise la clé. Une limite de création temporaire laisse le cache accessible en lecture et respecte le délai annoncé par le backend. Une clé refusée n'est pas remplacée automatiquement. Les prix reçus du backend ne sont pas réexpédiés comme de nouvelles observations. La date originale est toujours conservée et un prix ancien ne remplace pas un prix plus récent.
+
+Les contributeurs réservent temporairement une carte manquante afin d'éviter plusieurs consultations simultanées. Les autres attendent puis relisent le cache. Une actualisation **↻** peut ainsi réutiliser une réponse plus récente d'un autre contributeur. Une panne du backend laisse le traitement local disponible, toujours soumis au délai WikiMasters. Les quotas du site ne sont pas augmentés et ses refus ne sont pas levés par le cache.
+
+Les prix partagés portent la mention **Partagé**. Les contributions sont ouvertes, leur format est validé et les clés sont révocables. Les chiffres envoyés par les navigateurs ne sont pas signés par le jeu : un utilisateur peut envoyer de fausses valeurs. Ces indications communautaires ne constituent pas une certification des prix.
+
+Le backend Node.js/TypeScript strict et PostgreSQL est maintenu séparément dans `Eplp-Homelab/wiki-masters-cache` et déployé par Coolify avec son propre Compose.
+
 ## Confidentialité et limites
 
-Pas de compte supplémentaire, de télémétrie ni de serveur du projet recevant la collection. Les données du jeu restent dans le navigateur et les requêtes utilisent la session WikiMasters existante. GitHub sert les fichiers d'installation et de mise à jour.
+Sans activation du cache partagé, les prix restent locaux. Quand il est activé, le backend reçoit les IDs de cartes recherchées et l'adresse IP réseau ; avec le partage automatique, il reçoit aussi les statistiques par rareté et leurs dates. Il ne reçoit ni cookies, ni jetons WikiMasters, ni identité du joueur, ni contenu de ses notifications. Aucun inventaire d'exemplaires possédés n'est envoyé. Les journaux HTTP de l'hébergement peuvent conserver les métadonnées réseau.
+
+La clé de contribution est enregistrée dans le stockage du site par ce userscript et n'est pas un secret d'administration. Elle doit être personnelle et révocable ; éviter de la partager. Désactiver le cache arrête les prochains échanges avec le backend. GitHub sert les fichiers d'installation et de mise à jour.
 
 Le script dépend de l'interface et de détails internes de React qui peuvent changer. Les règles du service et les contrôles de son API restent applicables. Lire [NOTICE.md](NOTICE.md) pour les risques, les responsabilités, les modifications par des tiers et la portée de la licence.
 
@@ -124,7 +141,7 @@ npx playwright install chromium
 npm test
 ```
 
-Les cinq suites utilisent des pages isolées et des réponses réseau simulées. Elles couvrent les prix, les notifications, les enchères, les réglages de synchronisation et la pagination. Les contrôles vérifient notamment les réponses lentes dont le corps arrive après les en-têtes, le délai entre deux onglets, les réglages persistants, l'arrêt pendant une requête, les pauses serveur et le parcours des seules cartes visibles sans double clic sur **Suivant**. La visibilité et les retards de timers sont simulés pour vérifier le traitement en arrière-plan ; ils ne reproduisent pas toutes les politiques d'économie d'énergie des navigateurs. Aucun compte WikiMasters n'est nécessaire et aucune enchère réelle n'est créée.
+Les six suites utilisent des pages isolées et des réponses réseau simulées. Elles couvrent les prix, les notifications, les enchères, les réglages de synchronisation, la pagination et le cache partagé. Les contrôles vérifient notamment les réponses lentes dont le corps arrive après les en-têtes, le délai entre deux onglets, les réglages persistants, l'arrêt pendant une requête, les pauses serveur et le parcours de toutes les cartes de la page courante (cas de 50 cartes inclus) sans double clic sur **Suivant**. Le cache partagé est testé avec lectures par lots, imports, réservations concurrentes, création automatique de clé entre onglets, révocation, réponses invalides, panne et absence de fuite des identifiants du jeu. La visibilité et les retards de timers sont simulés pour vérifier le traitement en arrière-plan ; ils ne reproduisent pas toutes les politiques d'économie d'énergie des navigateurs. Aucun compte WikiMasters n'est nécessaire et aucune enchère réelle n'est créée.
 
 Une vérification séparée sur l'interface réelle avec soumission simulée a également contrôlé la conservation de la page, des filtres et des autres cartes. Les extensions elles-mêmes et les installations physiques Android/iOS restent à valider ; un écran de 390 px n'est pas un test sur téléphone.
 

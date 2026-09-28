@@ -7,7 +7,7 @@ const page = await browser.newPage();
 page.wikiTestSource = await readFile(new URL('wiki-masters-market.user.js', root), 'utf8');
 let passed = 0;
 try {
-  for (const name of ['browser-tests.js', 'notification-tests.js', 'auction-tests.js', 'sync-tests.js', 'pagination-tests.js']) {
+  for (const name of ['browser-tests.js', 'notification-tests.js', 'auction-tests.js', 'sync-tests.js', 'pagination-tests.js', 'shared-cache-tests.js']) {
     // Ces fichiers sont des fonctions de test du dépôt, également exécutables
     // via le MCP Playwright. Ne jamais y charger de code distant.
     const source = await readFile(new URL(name, root), 'utf8');
