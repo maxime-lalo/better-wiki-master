@@ -48,7 +48,7 @@ async (page) => {
       const url=new URL(typeof input==='string'?input:input.url,location.href);
       const kind=url.pathname==='/api/my-collection'?'page':'price';
       if(kind==='price'&&!url.pathname.match(/^\\/api\\/marketplace\\/cards\\/[^/]+\\/sales$/))throw new Error('Requête imprévue');
-      const call={kind,url:url.href,startedAt:Date.now(),page:Number(url.searchParams.get('page'))+1};window.testCalls.push(call);
+      const call={kind,url:url.href,startedAt:Date.now(),hidden:document.hidden,page:Number(url.searchParams.get('page'))+1};window.testCalls.push(call);
       const stream=new ReadableStream({start(controller){window.testPending.push({call,controller});}});
       const status=kind==='page'?window.collectionStatus:200;
       return new Response(stream,{status,headers:{'Content-Type':'application/json',...(status===429?{'Retry-After':'900'}:{})}});
@@ -75,7 +75,7 @@ async (page) => {
   const calls = () => p.evaluate(() => window.testCalls);
   const reset = async () => {
     await p.evaluate(() => { localStorage.clear();localStorage.setItem('wm-market-v1:sync-settings',JSON.stringify({enabled:false,autoNext:true,intervalMs:1000})); });
-    await p.reload();await advance(300);await p.evaluate(() => scrollTo(0,0));
+    await p.goto('https://www.wiki-masters.com/collection');await advance(300);await p.evaluate(() => scrollTo(0,0));
     await p.locator('.cursor-pointer').first().scrollIntoViewIfNeeded();
     await p.evaluate(() => window.cachePage(1));
   };
@@ -83,6 +83,7 @@ async (page) => {
     await p.clock.install();await p.goto('https://www.wiki-masters.com/collection');await advance(300);
     assert(!await option().isChecked(), 'Case exacte présente et désactivée par défaut');
     assert((await calls()).length===1, 'Une seule carte visible démarre');
+    await p.evaluate(()=>{window.testHidden=true;document.dispatchEvent(new Event('visibilitychange'));});
     await advance(2500);
     assert((await calls()).length===1 && await clicks()===0, 'Ni seconde carte ni navigation avant la première réponse complète');
     const firstEnd=await finish('price');await advance(1300);
@@ -104,6 +105,7 @@ async (page) => {
     const completed=await calls();
     assert(await clicks()===2 && await p.evaluate(()=>window.currentPage)===3, 'Arrêt à la dernière page');
     assert(completed.filter(c=>c.kind==='price').length===6 && completed.filter(c=>c.kind==='price').every(c=>!c.url.includes('000000000013')&&!c.url.includes('000000000023')&&!c.url.includes('000000000033')), 'Six cartes visibles traitées, zéro carte hors écran');
+    assert(completed.slice(1).every(c=>c.hidden) && completed.length===8, 'Les cinq prix suivants et les deux changements de page continuent en arrière-plan');
     assert(completed.filter(c=>c.kind==='page').every(c=>c.url.includes('rarity=L&search=conserve')), 'Paramètres natifs et filtres conservés');
     assert((await p.locator('.wm-sync-detail').innerText()).includes('Dernière page'), 'Fin du parcours signalée dans le bandeau');
     await p.reload();await advance(1000);
@@ -120,11 +122,12 @@ async (page) => {
     assert(await clicks()===0, 'Un détail ou formulaire ouvert empêche le changement automatique');
     await p.evaluate(()=>document.querySelector('[role="dialog"]').remove());
     await p.evaluate(()=>{window.testHidden=true;document.dispatchEvent(new Event('visibilitychange'));});await advance(2000);
-    assert(await clicks()===0, 'Pas de changement de page dans un onglet masqué');
+    assert(await clicks()===1 && (await calls())[0].hidden, 'Passage automatique à la page suivante dans un onglet masqué');
     await p.evaluate(()=>{window.testHidden=false;document.dispatchEvent(new Event('visibilitychange'));});await advance(900);
-    assert(await clicks()===1, 'Reprise du parcours quand l’onglet redevient visible');
+    assert(await clicks()===1 && (await calls()).length===1, 'Retour au premier plan sans double clic ni nouvelle requête pendant le chargement');
+    await p.evaluate(()=>{window.testHidden=true;});
     await toggle().uncheck();await finish('page');await advance(5000);
-    assert(await clicks()===1 && (await calls()).length===1, 'Interrupteur global : ni prix ni navigation supplémentaires');
+    assert(await clicks()===1 && (await calls()).length===1, 'Interrupteur global respecté aussi en arrière-plan');
 
     await reset();
     await p.evaluate(()=>{const h=document.querySelector('h3');delete h.__reactFiber$test;});await advance(300);
@@ -141,9 +144,25 @@ async (page) => {
     assert((await calls()).some(c=>c.kind==='price'), 'Le bouton de reprise réarme le traitement après une navigation bloquée');
     await toggle().uncheck();await finish('price');
 
-    await reset();await p.evaluate(()=>{window.collectionStatus=429;});await toggle().check();await advance(900);await finish('page');await advance(1000);
+    await reset();await p.evaluate(()=>{window.testHidden=true;});await toggle().check();await advance(900);await finish('page');
+    // Avancer l'heure sans exécuter les timers simule un réveil tardif du navigateur.
+    await p.clock.setSystemTime(await p.evaluate(()=>Date.now()+60000));await advance(900);
+    assert(await clicks()===1 && await p.evaluate(()=>window.currentPage)===2
+      && !(await p.locator('.wm-sync-status').innerText()).includes('arrêté'), 'Un timer réveillé une minute plus tard ne met pas en erreur une page déjà chargée');
+    assert((await calls()).length===1, 'Aucune rafale de rattrapage après le retard du navigateur');
+    await advance(1400);
+    const afterDelay=await calls();
+    assert(afterDelay.length===2 && afterDelay[1].kind==='price' && afterDelay[1].hidden
+      && afterDelay[1].startedAt-afterDelay[0].finishedAt>=1000, 'Prix repris en arrière-plan après la page confirmée et le délai minimal');
+    await toggle().uncheck();await finish('price');
+
+    await reset();await toggle().check();
+    await p.evaluate(()=>{window.testHidden=true;history.pushState(null,'','/marketplace');});await advance(2000);
+    assert(await clicks()===0 && (await calls()).length===0, 'Quitter la collection dans le même onglet arrête les appels et la pagination');
+
+    await reset();await p.evaluate(()=>{window.testHidden=true;window.collectionStatus=429;});await toggle().check();await advance(900);await finish('page');await advance(1000);
     await option().uncheck();await option().check();await advance(3000);
-    assert(await clicks()===1 && await p.getByRole('button',{name:'Reprendre le chargement'}).isDisabled(), 'Un 429 de pagination conserve Retry-After malgré les changements d’option');
+    assert(await clicks()===1 && await p.getByRole('button',{name:'Reprendre le chargement'}).isDisabled(), 'Un 429 de pagination conserve Retry-After en arrière-plan malgré les changements d’option');
     await p.setViewportSize({width:390,height:844});
     assert(await option().isVisible() && await p.locator('#wm-market-controls').evaluate(el=>el.scrollWidth<=el.clientWidth && el.getBoundingClientRect().right<=innerWidth), 'Case accessible et bandeau sans débordement sur écran de 390 px');
     assert(errors.length===0 && externalRequests===0, 'Aucune erreur JavaScript, aucun appel réel au jeu');

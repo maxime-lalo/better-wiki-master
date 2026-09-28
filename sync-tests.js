@@ -17,7 +17,7 @@ async (page) => {
     return route.fulfill({ status: 200, contentType: 'text/html', body: fixture });
   });
   await context.addInitScript({ content: `
-    Object.defineProperty(document,'hidden',{get:()=>false});
+    window.testHidden=false;Object.defineProperty(document,'hidden',{get:()=>window.testHidden});
     window.testCalls=[];window.testPending=[];window.testStatus=200;
     window.fetch=async (input)=>{
       const url=new URL(typeof input==='string'?input:input.url,location.href);
@@ -131,6 +131,7 @@ async (page) => {
     // déjà partagée : ne pas l'installer ni l'avancer une seconde fois ici.
     await p2.goto('https://www.wiki-masters.com/collection');
     await p.locator('.cursor-pointer').first().scrollIntoViewIfNeeded();
+    await p.evaluate(()=>{window.testHidden=true;document.dispatchEvent(new Event('visibilitychange'));});
     await toggle(p).check();
     await settle(p); await settle(p2);
     assert((await banner(p2).innerText()).includes('Carte Alpha (autre onglet)') && await toggle(p2).isChecked(), 'L’autre onglet affiche la même carte active et le même interrupteur');
@@ -139,7 +140,7 @@ async (page) => {
     assert(await slider(p).inputValue() === '4', 'Le délai choisi dans un autre onglet se répercute immédiatement');
     const advanceBoth = async ms => { await advance(ms, p); await settle(p2); };
     await advanceBoth(5000);
-    assert((await calls(p)).length + (await calls(p2)).length === 1, 'Deux onglets, réponse lente : toujours une seule requête en vol');
+    assert((await calls(p)).length + (await calls(p2)).length === 1, 'Un onglet en arrière-plan et un au premier plan : une seule requête en vol');
     const crossEnd = await p.evaluate(() => window.finishBody());
     await settle(p); await settle(p2);
     await advanceBoth(3800);

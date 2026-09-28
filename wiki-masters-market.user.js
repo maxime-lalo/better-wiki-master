@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters — Prix de la collection
 // @namespace    local.wikimasters.collection
-// @version      1.5.0
+// @version      1.5.1
 // @description  Prix en cache, filtres des notifications et mise aux enchères sans quitter la collection.
 // @author       maxime-lalo
 // @license      MIT
@@ -429,7 +429,9 @@
   }
 
   function visible(view) {
-    if (!view.node.isConnected || document.hidden || location.pathname !== '/collection') return false;
+    // La zone affichée de la collection reste la référence même si l'onglet
+    // est en arrière-plan. Ne pas étendre le chargement aux cartes hors écran.
+    if (!view.node.isConnected || location.pathname !== '/collection') return false;
     const r = view.cardNode.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
   }
@@ -551,8 +553,7 @@
     else if (paused) {
       message = 'Synchronisation en pause après une erreur.';
       detail = `Pause jusqu’au ${new Date(g.until).toLocaleString('fr-FR')}. Les prix en cache sont conservés.`;
-    } else if (document.hidden) message = 'Synchronisation en attente — onglet non visible.';
-    else if (pageError && settings.autoNext) {
+    } else if (pageError && settings.autoNext) {
       message = 'Passage automatique arrêté.';
       detail = pageError + ' Utiliser « Reprendre le chargement » pour réessayer.';
     } else if (collectionLoads.size) message = 'En attente du chargement de la collection.';
@@ -709,7 +710,7 @@
     try {
       pagination.next.click();
       let settledSince = 0;
-      while (Date.now() - started < REQUEST_TIMEOUT_MS) {
+      while (true) {
         await new Promise(resolve => setTimeout(resolve, 100));
         if (location.pathname !== '/collection') return;
         const load = lastCollectionLoad;
@@ -720,10 +721,16 @@
           if (!collectionLoads.size && current && !current.loading && current.page === target) {
             settledSince ||= Date.now();
             if (Date.now() - settledSince >= 500) { scan(); return; }
+            // Un timer d'arrière-plan peut se réveiller après le délai maximal.
+            // La page confirmée a priorité : terminer sa stabilisation, sans
+            // transformer le retard du navigateur en erreur de chargement.
+            continue;
           } else settledSince = 0;
         }
+        if (Date.now() - started >= REQUEST_TIMEOUT_MS) {
+          throw new Error('La nouvelle page ne répond pas ou son affichage n’a pas pu être confirmé.');
+        }
       }
-      throw new Error('La nouvelle page ne répond pas ou son affichage n’a pas pu être confirmé.');
     } catch (error) {
       pageError = error.message || 'Le changement de page a échoué.';
     } finally {
@@ -739,7 +746,7 @@
 
   async function pump() {
     const settings = syncSettings();
-    if (!settings.enabled || (settings.autoNext && pageError) || automationBlocked() || busy || collectionLoads.size || !storageOK || !navigator.locks || document.hidden || location.pathname !== '/collection') return;
+    if (!settings.enabled || (settings.autoNext && pageError) || automationBlocked() || busy || collectionLoads.size || !storageOK || !navigator.locks || location.pathname !== '/collection') return;
     const g = gate();
     if (Date.now() < Math.max(nextRequestAt(g), g.until, g.retryAfterUntil) || (!choose() && !nextPageReady())) return;
     busy = true;
@@ -747,7 +754,7 @@
       // ifAvailable évite d'accumuler une file d'onglets en attente.
       await navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
         const settings = syncSettings();
-        if (!lock || !settings.enabled || (settings.autoNext && pageError) || automationBlocked() || collectionLoads.size || !storageOK || document.hidden || location.pathname !== '/collection') return;
+        if (!lock || !settings.enabled || (settings.autoNext && pageError) || automationBlocked() || collectionLoads.size || !storageOK || location.pathname !== '/collection') return;
         const current = gate();
         if (Date.now() < Math.max(nextRequestAt(current), current.until, current.retryAfterUntil)) return;
         const job = choose(); // Relire le cache APRES avoir obtenu le verrou.
@@ -873,7 +880,7 @@
       }
       renderAll();
     });
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) { scheduleScan(); void pump(); } });
+    document.addEventListener('visibilitychange', () => { scheduleScan(); void pump(); });
     document.addEventListener('scroll', () => { pageCandidate = null; }, { capture: true, passive: true });
     // Contrôle local, sans appel réseau : gère aussi pagination et navigation SPA.
     setInterval(renderAll, 1000);
