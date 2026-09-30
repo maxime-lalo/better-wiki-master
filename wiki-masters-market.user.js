@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters — Prix de la collection
 // @namespace    local.wikimasters.collection
-// @version      1.6.1
+// @version      1.7.0
 // @description  Prix en cache, filtres des notifications et mise aux enchères sans quitter la collection.
 // @author       maxime-lalo
 // @license      MIT
@@ -67,6 +67,7 @@
   const GATE_KEY = PREFIX + 'gate';
   const BLOCK_KEY = PREFIX + 'automation-block';
   const SETTINGS_KEY = PREFIX + 'sync-settings';
+  const PAGE_SORT_KEY = PREFIX + 'page-sort';
   const NOTIFICATION_FILTER_KEY = PREFIX + 'notification-filter';
   const LOCK = PREFIX + 'request';
   const RARITIES = ['C', 'PC', 'R', 'SR', 'UR', 'L'];
@@ -76,6 +77,7 @@
   const manual = new Map();
   const failures = new Map();
   const catalogue = new Map();
+  const sortedWrappers = new Set();
   let busy = false;
   let activeId = null;
   let scanTimer;
@@ -674,7 +676,48 @@
       error || '',
     ].filter(Boolean).join('\n');
   }
-  function renderAll() { for (const view of views.values()) render(view); renderControls(); }
+  function pageSortMode() {
+    const mode = read(PAGE_SORT_KEY);
+    return ['count-desc', 'count-asc', 'average-desc', 'average-asc'].includes(mode) ? mode : 'native';
+  }
+  function applyPageSort() {
+    const mode = pageSortMode(), desired = new Map();
+    if (mode !== 'native' && location.pathname === '/collection') {
+      const [metric, direction] = mode.split('-'), grids = new Map();
+      for (const cardNode of pageCardNodes()) {
+        const wrapper = cardNode.parentElement, grid = wrapper.parentElement;
+        if (!grid) continue;
+        const view = views.get(cardNode), info = cardInfo(cardNode.querySelector('h3'), cardNode);
+        const entry = view && info?.id === view.id && info.rarity === view.rarity ? cached(view.id) : null;
+        const stats = entry?.summary[view?.rarity];
+        const value = metric === 'count' ? entry ? stats?.count ?? 0 : null : stats?.average ?? null;
+        if (!grids.has(grid)) grids.set(grid, []);
+        const items = grids.get(grid);
+        items.push({ wrapper, value, index: items.length });
+      }
+      for (const items of grids.values()) {
+        items.sort((a, b) => {
+          if (a.value === null || b.value === null) return a.value === b.value ? a.index - b.index : a.value === null ? 1 : -1;
+          return (direction === 'asc' ? a.value - b.value : b.value - a.value) || a.index - b.index;
+        });
+        items.forEach((item, index) => desired.set(item.wrapper, String(index + 1)));
+      }
+    }
+    // Modifier uniquement l'ordre visuel des wrappers, jamais déplacer les
+    // nœuds gérés par React : suppression, sélection et enchères restent natives.
+    for (const wrapper of sortedWrappers) {
+      if (desired.has(wrapper)) continue;
+      wrapper.classList.remove('wm-page-sorted-card');
+      wrapper.style.removeProperty('--wm-page-sort-order');
+      sortedWrappers.delete(wrapper);
+    }
+    for (const [wrapper, order] of desired) {
+      if (!wrapper.classList.contains('wm-page-sorted-card')) wrapper.classList.add('wm-page-sorted-card');
+      if (wrapper.style.getPropertyValue('--wm-page-sort-order') !== order) wrapper.style.setProperty('--wm-page-sort-order', order);
+      sortedWrappers.add(wrapper);
+    }
+  }
+  function renderAll() { for (const view of views.values()) render(view); applyPageSort(); renderControls(); }
 
   async function resumeLoading() {
     if (resuming || !syncSettings().enabled || !storageOK || !navigator.locks || gate().retryAfterUntil > Date.now()) return;
@@ -711,6 +754,13 @@
         <strong class="wm-sync-status" role="status" aria-live="polite"></strong>
         <span class="wm-sync-detail"></span><span class="wm-sync-progress"></span>
       </div><div class="wm-sync-settings">
+        <label class="wm-page-sort">Trier cette page<select aria-label="Trier les cartes de cette page">
+          <option value="native">Ordre du site</option>
+          <option value="count-desc">Nombre de ventes (décroissant)</option>
+          <option value="count-asc">Nombre de ventes (croissant)</option>
+          <option value="average-desc">Prix moyen (décroissant)</option>
+          <option value="average-asc">Prix moyen (croissant)</option>
+        </select><span>Valeurs en cache · données manquantes à la fin</span></label>
         <label class="wm-sync-toggle"><input type="checkbox" role="switch" aria-label="Synchronisation des prix"><span>Synchronisation des prix</span></label>
         <label class="wm-sync-delay" for="wm-sync-delay"><span>Délai après chaque réponse <output></output></span>
           <input id="wm-sync-delay" type="range" min="1" max="30" step="0.5" aria-label="Délai après chaque réponse (secondes)">
@@ -728,6 +778,10 @@
         </details><span class="wm-shared-status" role="status"></span>
         <button class="wm-sync-resume" type="button">Reprendre le chargement</button>
       </div>`;
+      controls.querySelector('.wm-page-sort select').addEventListener('change', event => {
+        write(PAGE_SORT_KEY, event.target.value);
+        renderAll();
+      });
       controls.querySelector('[role="switch"]').addEventListener('change', event => {
         setSyncSettings({ enabled: event.target.checked });
       });
@@ -828,6 +882,7 @@
     setText('.wm-sync-detail', detail);
     const count = recognizedViews.filter(view => cached(view.id)).length;
     setText('.wm-sync-progress', `${count} / ${pageNodes.length} cartes de cette page en cache`);
+    controls.querySelector('.wm-page-sort select').value = pageSortMode();
     controls.querySelector('[role="switch"]').checked = settings.enabled;
     controls.querySelector('.wm-sync-auto-next input').checked = settings.autoNext;
     controls.querySelector('.wm-shared-enabled').checked = settings.sharedEnabled;
@@ -878,7 +933,7 @@
         view.node.remove(); views.delete(cardNode);
       }
     }
-    if (location.pathname !== '/collection') { manual.clear(); renderControls(); return; }
+    if (location.pathname !== '/collection') { manual.clear(); applyPageSort(); renderControls(); return; }
     for (const heading of document.querySelectorAll('main h3')) {
       const cardNode = heading.closest('div.cursor-pointer');
       if (!cardNode || !cardNode.parentElement?.classList.contains('group')) continue;
@@ -892,6 +947,7 @@
       if (!view.node.isConnected) cardNode.insertAdjacentElement('afterend', view.node);
       render(view);
     }
+    applyPageSort();
     renderControls();
   }
   function scheduleScan() {
@@ -1117,6 +1173,10 @@
       .wm-sync-summary{display:flex;flex:1 1 240px;min-width:0;flex-direction:column;gap:4px;overflow-wrap:anywhere}
       .wm-sync-status{color:#a4eccf;font-size:13px}.wm-sync-detail{color:#c1d2c8}.wm-sync-progress{color:#91a89b;font-size:11px}
       .wm-sync-settings{display:flex;flex:0 1 270px;min-width:0;max-width:100%;flex-direction:column;gap:10px}
+      .wm-page-sorted-card{order:var(--wm-page-sort-order)!important}
+      .wm-page-sort{display:flex;flex-direction:column;gap:5px}.wm-page-sort span{font-size:10px;color:#91a89b}
+      .wm-page-sort select{box-sizing:border-box;width:100%;min-width:0;max-width:100%;padding:7px;border:1px solid #ffffff30;border-radius:6px;background:#19251e;color:inherit;font:inherit}
+      .wm-page-sort select:focus-visible{outline:2px solid #39e2a8;outline-offset:3px}
       .wm-sync-toggle{display:flex;align-items:center;gap:8px;cursor:pointer}
       .wm-sync-toggle input{appearance:none;position:relative;flex:none;width:34px;height:20px;margin:0;border:1px solid #ffffff40;border-radius:20px;background:#344039;cursor:pointer}
       .wm-sync-toggle input:after{content:'';position:absolute;left:3px;top:3px;width:12px;height:12px;border-radius:50%;background:#d8e6df}

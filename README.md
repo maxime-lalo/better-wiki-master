@@ -21,6 +21,7 @@ Les améliorations s'appliquent au site ouvert dans ce navigateur. Elles ne s'in
 ## Fonctionnalités
 
 - **Prix sur les cartes** : prix moyen, dernière vente et nombre de ventes, selon la rareté effective et les données du formulaire de mise aux enchères.
+- **Tri de la page courante** : nombre de ventes ou prix moyen, dans l'ordre croissant ou décroissant, à partir des valeurs en cache et sans requête supplémentaire.
 - **Cache sans expiration** : les données déjà récupérées sont réutilisées. Le bouton **↻** actualise une carte ; sa date de consultation reste visible.
 - **Cache partagé facultatif** : recherche de toutes les cartes de la page courante en une requête groupée, avant de charger les prix manquants depuis WikiMasters. L'activation crée automatiquement une clé par installation et partage les prix locaux et les nouvelles réponses.
 - **Bandeau permanent** : reste visible sur la collection et pendant le défilement, avec l'état, le nom de la carte en cours, la prochaine carte, le compte à rebours et le nombre de cartes de la page en cache.
@@ -92,6 +93,14 @@ Le cache local reste propre au navigateur et à l'appareil. Effacer les données
 | Prix anciens ou manquants | Cache sans expiration, absence de ventes, accès refusé ou données indisponibles pour le compte. Le comportement non Pro n'a pas été validé. |
 | Redirection revenue après une mise en vente | Le site a peut-être changé. Le script garde le flux natif si son adaptation ne reconnaît plus la structure du formulaire. |
 
+### Trier les cartes de la page
+
+Dans le bandeau, **Trier cette page** propose le **nombre de ventes** et le **prix moyen**, chacun en ordre croissant ou décroissant. Le tri porte sur toutes les cartes de la page courante, y compris celles plus bas dans la grille, et utilise les statistiques de leur rareté. Il ne lance aucune requête supplémentaire et fonctionne aussi quand la synchronisation est désactivée.
+
+Les cartes sans donnée pour le critère choisi restent à la fin dans les deux sens. Une carte dont la rareté est absente des statistiques reçues compte pour zéro vente, sans prix moyen. Les égalités conservent l'ordre du site. L'affichage se réordonne à mesure que de nouvelles statistiques arrivent en cache.
+
+Le choix est conservé entre visites et partagé entre onglets. À la page suivante, le même tri s'applique aux cartes de cette nouvelle page : il ne trie pas toute la collection entre les pages. Choisir **Ordre du site** rétablit la présentation native.
+
 ### Contrôler la synchronisation
 
 Le bandeau de collection propose un interrupteur **Synchronisation des prix** et un curseur **Délai après chaque réponse**, de **1 à 30 secondes**, par pas de 0,5 seconde ; le réglage initial est d'une seconde.
@@ -146,7 +155,9 @@ npx playwright install chromium
 npm test
 ```
 
-Les sept suites utilisent des pages isolées et des réponses réseau simulées. Elles couvrent les prix, les notifications, les enchères, les réglages de synchronisation, la pagination, le cache partagé et les réessais automatiques. Les réessais sont testés sur la succession 503 → 404 → succès, les actualisations avec un ancien prix, plusieurs onglets, les coupures, les expirations et les pauses serveur. Les contrôles vérifient notamment les réponses lentes dont le corps arrive après les en-têtes, le délai entre deux onglets, les réglages persistants, l'arrêt pendant une requête, les pauses serveur et le parcours de toutes les cartes de la page courante (cas de 50 cartes inclus) sans double clic sur **Suivant**. Le cache partagé est testé avec lectures par lots, imports, réservations concurrentes, création automatique de clé entre onglets, révocation, réponses invalides, panne et absence de fuite des identifiants du jeu. La visibilité et les retards de timers sont simulés pour vérifier le traitement en arrière-plan ; ils ne reproduisent pas toutes les politiques d'économie d'énergie des navigateurs. Aucun compte WikiMasters n'est nécessaire et aucune enchère réelle n'est créée.
+Les huit suites utilisent des pages isolées et des réponses réseau simulées. Elles couvrent les prix, les notifications, les enchères, les réglages de synchronisation, la pagination, le cache partagé, les réessais automatiques et le tri de la page courante. Les réessais sont testés sur la succession 503 → 404 → succès, les actualisations avec un ancien prix, plusieurs onglets, les coupures, les expirations et les pauses serveur. Les contrôles vérifient notamment les réponses lentes dont le corps arrive après les en-têtes, le délai entre deux onglets, les réglages persistants, l'arrêt pendant une requête, les pauses serveur et le parcours de toutes les cartes de la page courante (cas de 50 cartes inclus) sans double clic sur **Suivant**. Le cache partagé est testé avec lectures par lots, imports, réservations concurrentes, création automatique de clé entre onglets, révocation, réponses invalides, panne et absence de fuite des identifiants du jeu. La visibilité et les retards de timers sont simulés pour vérifier le traitement en arrière-plan ; ils ne reproduisent pas toutes les politiques d'économie d'énergie des navigateurs. Aucun compte WikiMasters n'est nécessaire et aucune enchère réelle n'est créée.
+
+Le tri est vérifié dans les deux sens, avec plusieurs raretés, des données manquantes, des égalités, les mises à jour du cache entre onglets et le passage à une page de 50 cartes. Les tests contrôlent les positions affichées, le retour à l'ordre natif et la conservation des clics et des nœuds gérés par le site.
 
 Une vérification séparée sur l'interface réelle avec soumission simulée a également contrôlé la conservation de la page, des filtres et des autres cartes. Les extensions elles-mêmes et les installations physiques Android/iOS restent à valider ; un écran de 390 px n'est pas un test sur téléphone.
 
